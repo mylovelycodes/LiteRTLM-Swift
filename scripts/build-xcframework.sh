@@ -54,11 +54,16 @@ info "Using LiteRT-LM source at: $LITERT_LM_DIR"
 # ---------------------------------------------------------------------------
 # 1b. Patch upstream BUILD if needed
 # ---------------------------------------------------------------------------
-# The upstream c/BUILD loads `:ios_engine.bzl` which doesn't ship in the repo
-# yet. Without the stub, Bazel can't parse the BUILD file and ALL targets in
-# the package appear missing ("no such target").
+# Two patches may be needed depending on the upstream version:
+#
+# 1. ios_engine.bzl stub — HEAD's c/BUILD loads `:ios_engine.bzl` which isn't
+#    shipped yet. Without the stub Bazel can't parse the BUILD file at all.
+#
+# 2. cc_binary dylib target — releases up to v0.10.2 only define cc_library
+#    targets (:engine, :engine_cpu). The cc_binary that produces the shared
+#    library was added later. We append it if missing.
 
-if [ ! -f "$LITERT_LM_DIR/c/ios_engine.bzl" ]; then
+if [ ! -f "$LITERT_LM_DIR/c/ios_engine.bzl" ] && grep -q 'ios_engine\.bzl' "$LITERT_LM_DIR/c/BUILD"; then
     info "Creating stub ios_engine.bzl (missing from upstream)..."
     cat > "$LITERT_LM_DIR/c/ios_engine.bzl" << 'STUB'
 """Stub for ios_shared_engine macro (not yet published upstream)."""
@@ -66,6 +71,31 @@ if [ ! -f "$LITERT_LM_DIR/c/ios_engine.bzl" ]; then
 def ios_shared_engine(**kwargs):
     pass
 STUB
+fi
+
+if ! grep -q 'libLiteRTLMEngine\.dylib' "$LITERT_LM_DIR/c/BUILD"; then
+    info "Adding libLiteRTLMEngine.dylib target (not present in this version)..."
+    cat >> "$LITERT_LM_DIR/c/BUILD" << 'BUILD_PATCH'
+
+cc_binary(
+    name = "libLiteRTLMEngine.dylib",
+    srcs = [
+        "engine.cc",
+        "engine.h",
+        "litert_lm_logging.cc",
+        "litert_lm_logging.h",
+    ],
+    linkopts = [
+        "-Wl,-exported_symbol,_litert_lm_*",
+    ],
+    linkshared = True,
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = ENGINE_COMMON_DEPS + [
+        "//runtime/core:engine_impl",
+    ],
+)
+BUILD_PATCH
 fi
 
 # ---------------------------------------------------------------------------

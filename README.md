@@ -411,7 +411,7 @@ This repo ships a prebuilt `CLiteRTLM.xcframework`. If you want to build it your
 
 The script will:
 1. Clone (or use existing) [google-ai-edge/LiteRT-LM](https://github.com/google-ai-edge/LiteRT-LM) source
-2. Patch missing `ios_engine.bzl` if needed (upstream BUILD references a file not yet published)
+2. Patch `c/BUILD` if needed — adds the `cc_binary` dylib target (missing in v0.10.2 and earlier) and stubs `ios_engine.bzl` (missing in HEAD)
 3. Build `libLiteRTLMEngine.dylib` for `ios_arm64` (device) and `ios_sim_arm64` (simulator)
 4. Package both into `Frameworks/LiteRTLM.xcframework`
 
@@ -424,9 +424,37 @@ git clone https://github.com/google-ai-edge/LiteRT-LM.git
 cd LiteRT-LM
 ```
 
-#### 2. Patch missing `ios_engine.bzl`
+#### 2. Patch `c/BUILD`
 
-The upstream `c/BUILD` loads `ios_engine.bzl` which is not yet published. Create a stub so Bazel can parse the BUILD file:
+The upstream BUILD file may need patching depending on the version:
+
+**a) Releases up to v0.10.2** — the `cc_binary` target for the shared library doesn't exist yet. Append it:
+
+```bash
+cat >> c/BUILD << 'EOF'
+
+cc_binary(
+    name = "libLiteRTLMEngine.dylib",
+    srcs = [
+        "engine.cc",
+        "engine.h",
+        "litert_lm_logging.cc",
+        "litert_lm_logging.h",
+    ],
+    linkopts = [
+        "-Wl,-exported_symbol,_litert_lm_*",
+    ],
+    linkshared = True,
+    linkstatic = True,
+    visibility = ["//visibility:public"],
+    deps = ENGINE_COMMON_DEPS + [
+        "//runtime/core:engine_impl",
+    ],
+)
+EOF
+```
+
+**b) Latest HEAD** — `c/BUILD` loads `ios_engine.bzl` which isn't published. Create a stub:
 
 ```bash
 cat > c/ios_engine.bzl << 'EOF'
@@ -437,7 +465,7 @@ def ios_shared_engine(**kwargs):
 EOF
 ```
 
-> The build script (`Option A`) handles this automatically.
+> The build script (`Option A`) detects and applies both patches automatically.
 
 #### 3. Build for iOS device (arm64)
 
@@ -572,7 +600,7 @@ nm -gU Frameworks/LiteRTLM.xcframework/ios-arm64/CLiteRTLM.framework/CLiteRTLM |
 
 | Issue | Solution |
 |-------|----------|
-| `no such target '//c:libLiteRTLMEngine.dylib'` | Create the stub `c/ios_engine.bzl` (see Step 2 above). The upstream BUILD loads a .bzl file that isn't published yet |
+| `no such target '//c:libLiteRTLMEngine.dylib'` | Two possible causes: (1) v0.10.2 and earlier don't define the `cc_binary` dylib target — append it per Step 2a; (2) HEAD loads a missing `ios_engine.bzl` which breaks BUILD parsing — create the stub per Step 2b |
 | `no such package '@build_bazel_apple_support'` | Run `bazel sync` to fetch external dependencies |
 | Xcode SDK not found | Ensure Xcode is selected: `sudo xcode-select -s /Applications/Xcode.app` |
 | Build takes very long | First build downloads ~10 GB of deps. Subsequent builds use cache |
