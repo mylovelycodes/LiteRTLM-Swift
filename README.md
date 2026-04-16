@@ -93,7 +93,7 @@ let transcript = try await engine.audio(
 print(transcript)
 ```
 
-> **Important:** Text generation (`generate`, `generateStreaming`, `openSession`) requires Gemma 4's turn marker format in the prompt (see [Prompt Format](#gemma-4-prompt-format)). Vision, audio, and multimodal methods take plain text prompts — the Conversation API handles formatting internally.
+> **Important:** Text generation (`generate`, `generateStreaming`, `openSession`) requires Gemma 4's turn marker format in the prompt (see [Prompt Format](#gemma-4-prompt-format)). All other methods — vision, audio, multimodal, and the persistent conversation API (`openConversation`/`conversationSend`) — take plain text prompts. The Conversation API handles formatting internally.
 
 ## More Examples
 
@@ -156,6 +156,8 @@ let response = try await engine.multimodal(
 
 For multi-turn conversations, use the persistent session API. The KV cache is preserved across turns, reducing time-to-first-token from ~20s to ~1-2s on follow-up messages.
 
+#### Text-only (Session API)
+
 ```swift
 // Open a persistent session
 try await engine.openSession(temperature: 0.7, maxTokens: 512)
@@ -176,6 +178,36 @@ for try await chunk in engine.sessionGenerateStreaming(
 
 // Clean up when done
 engine.closeSession()
+```
+
+#### Multimodal (Conversation API)
+
+Mix images, audio, and text freely across turns — each turn reuses the KV cache:
+
+```swift
+// Open a persistent multimodal conversation
+try await engine.openConversation(temperature: 0.7)
+
+// Turn 1: send an image
+let description = try await engine.conversationSend(
+    imagesData: [photoData],
+    prompt: "What's in this photo?"
+)
+
+// Turn 2: text-only follow-up (KV cache reused — fast TTFT)
+let detail = try await engine.conversationSend(
+    prompt: "What color is the car in the background?"
+)
+
+// Turn 3: send audio
+let answer = try await engine.conversationSend(
+    audioData: [clipData],
+    audioFormat: .wav,
+    prompt: "Does this audio match the scene?"
+)
+
+// Clean up when done
+engine.closeConversation()
 ```
 
 ### Download Progress Tracking
@@ -251,9 +283,12 @@ struct EngineView: View {
 | `visionMultiImage(imagesData:prompt:temperature:maxTokens:maxImageDimension:)` | Multi-image understanding |
 | `audio(audioData:prompt:format:temperature:maxTokens:)` | Audio understanding (WAV, FLAC, MP3). Plain text prompt |
 | `multimodal(audioData:audioFormat:imagesData:prompt:temperature:maxTokens:maxImageDimension:)` | Combined audio + vision inference |
-| `openSession(temperature:maxTokens:)` | Open persistent session for multi-turn chat (KV cache reuse) |
-| `sessionGenerateStreaming(input:)` | Stream generation using persistent session |
-| `closeSession()` | Close persistent session, free KV cache |
+| `openSession(temperature:maxTokens:)` | Open persistent text session for multi-turn chat (KV cache reuse) |
+| `sessionGenerateStreaming(input:)` | Stream generation using persistent text session |
+| `closeSession()` | Close persistent text session, free KV cache |
+| `openConversation(temperature:maxTokens:)` | Open persistent multimodal conversation (KV cache reuse) |
+| `conversationSend(audioData:audioFormat:imagesData:prompt:maxImageDimension:)` | Send a turn in the persistent conversation (any mix of audio/images/text) |
+| `closeConversation()` | Close persistent multimodal conversation, free KV cache |
 
 | Property | Type | Description |
 |----------|------|-------------|
@@ -279,7 +314,7 @@ struct EngineView: View {
 
 ### Gemma 4 Prompt Format
 
-The **Session API** (text generation) requires Gemma 4's native turn marker format. The **Conversation API** (vision) does NOT — just pass plain text.
+The **Session API** (text generation) requires Gemma 4's native turn marker format. The **Conversation API** (vision, audio, multimodal, persistent conversation) does NOT — just pass plain text.
 
 ```
 <|turn>user
@@ -332,6 +367,7 @@ Tell me more.
 │  │ .audio()        │  │ .cancel()        │   │
 │  │ .multimodal()   │  │                  │   │
 │  │ .openSession()  │  │                  │   │
+│  │ .openConversation()                   │   │
 │  └────────┬────────┘  └──────────────────┘   │
 │           │                                  │
 │     Serial DispatchQueue                     │
@@ -348,7 +384,7 @@ Tell me more.
 ```
 
 - **Session API** — raw text prompts via `InputData`. You control the prompt format. Used by `generate()`, `generateStreaming()`, `openSession()`.
-- **Conversation API** — JSON-based messages with image/audio file paths. Handles image decode/resize/patchify and audio decode/resample/mel-spectrogram internally. Used by `vision()`, `visionMultiImage()`, `audio()`, `multimodal()`.
+- **Conversation API** — JSON-based messages with image/audio file paths. Handles image decode/resize/patchify and audio decode/resample/mel-spectrogram internally. Used by `vision()`, `visionMultiImage()`, `audio()`, `multimodal()`, `openConversation()`/`conversationSend()`.
 - All C API calls are serialized on a single `DispatchQueue` for thread safety. LiteRT-LM supports only one active session at a time.
 
 ## Building the XCFramework from Source

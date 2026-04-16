@@ -69,11 +69,17 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let eng = engine
         let ses = chatSession
         let sesCfg = chatSessionConfig
+        let conv = multimodalConversation
+        let convCfg = multimodalConvConfig
+        let convSesCfg = multimodalSessionConfig
         let queue = inferenceQueue
-        if eng != nil || ses != nil {
+        if eng != nil || ses != nil || conv != nil {
             queue.async {
                 if let s = ses { litert_lm_session_delete(s) }
                 if let c = sesCfg { litert_lm_session_config_delete(c) }
+                if let c = conv { litert_lm_conversation_delete(c) }
+                if let c = convCfg { litert_lm_conversation_config_delete(c) }
+                if let c = convSesCfg { litert_lm_session_config_delete(c) }
                 if let e = eng { litert_lm_engine_delete(e) }
             }
         }
@@ -159,6 +165,18 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             if let c = chatSessionConfig {
                 litert_lm_session_config_delete(c)
                 chatSessionConfig = nil
+            }
+            if let c = multimodalConversation {
+                litert_lm_conversation_delete(c)
+                multimodalConversation = nil
+            }
+            if let c = multimodalConvConfig {
+                litert_lm_conversation_config_delete(c)
+                multimodalConvConfig = nil
+            }
+            if let c = multimodalSessionConfig {
+                litert_lm_session_config_delete(c)
+                multimodalSessionConfig = nil
             }
             if let eng = engine { litert_lm_engine_delete(eng) }
             engine = nil
@@ -471,6 +489,186 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 chatSessionConfig = nil
             }
             Self.log.info("Persistent session closed")
+        }
+    }
+
+    // MARK: - Persistent Conversation (Multimodal KV Cache Reuse)
+    //
+    // Like the text-only persistent session above, but uses the Conversation
+    // API — supporting images, audio, and text. The conversation's KV cache
+    // persists across turns, so follow-up messages only prefill new tokens.
+
+    private var multimodalConversation: OpaquePointer?
+    private var multimodalConvConfig: OpaquePointer?
+    private var multimodalSessionConfig: OpaquePointer?
+
+    /// Open a persistent multimodal conversation with KV cache reuse.
+    ///
+    /// Call once when a conversation begins. Subsequent calls to
+    /// `conversationSend(...)` reuse this conversation's KV cache,
+    /// reducing TTFT from ~20s to ~1-2s for follow-up turns.
+    ///
+    /// - Parameters:
+    ///   - temperature: Sampling temperature. Default 0.7.
+    ///   - maxTokens: Maximum tokens per generation. Default 1024.
+    public func openConversation(temperature: Float = 0.7, maxTokens: Int = 1024) async throws {
+        try ensureReady()
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            inferenceQueue.async { [self] in
+                do {
+                    // Close existing conversation if any
+                    if let c = multimodalConversation {
+                        litert_lm_conversation_delete(c)
+                        multimodalConversation = nil
+                    }
+                    if let c = multimodalConvConfig {
+                        litert_lm_conversation_config_delete(c)
+                        multimodalConvConfig = nil
+                    }
+                    if let c = multimodalSessionConfig {
+                        litert_lm_session_config_delete(c)
+                        multimodalSessionConfig = nil
+                    }
+
+                    guard let eng = engine else { throw LiteRTLMError.modelNotLoaded }
+
+                    guard let sessionConfig = litert_lm_session_config_create() else {
+                        throw LiteRTLMError.inferenceFailure("Failed to create session config")
+                    }
+                    litert_lm_session_config_set_max_output_tokens(sessionConfig, Int32(maxTokens))
+                    var samplerParams = LiteRtLmSamplerParams(
+                        type: kTopP, top_k: 40, top_p: 0.95,
+                        temperature: temperature, seed: 0
+                    )
+                    litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
+
+                    guard let convConfig = litert_lm_conversation_config_create(
+                        eng, sessionConfig, nil, nil, nil, false
+                    ) else {
+                        litert_lm_session_config_delete(sessionConfig)
+                        throw LiteRTLMError.inferenceFailure("Failed to create conversation config")
+                    }
+
+                    guard let conversation = litert_lm_conversation_create(eng, convConfig) else {
+                        litert_lm_conversation_config_delete(convConfig)
+                        litert_lm_session_config_delete(sessionConfig)
+                        throw LiteRTLMError.inferenceFailure("Failed to create conversation")
+                    }
+
+                    multimodalConversation = conversation
+                    multimodalConvConfig = convConfig
+                    multimodalSessionConfig = sessionConfig
+                    Self.log.info("Persistent multimodal conversation opened")
+                    cont.resume()
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Send a message in the persistent multimodal conversation.
+    ///
+    /// Each call reuses the conversation's KV cache. Pass any combination of
+    /// audio, images, and text — or just text for a follow-up question.
+    ///
+    /// - Parameters:
+    ///   - audioData: Array of raw audio bytes. Pass empty array (default) for non-audio turns.
+    ///   - audioFormat: Audio container format. Default `.wav`.
+    ///   - imagesData: Array of raw image bytes. Pass empty array (default) for non-image turns.
+    ///   - prompt: Text prompt for this turn.
+    ///   - maxImageDimension: Resize image long edge to this value. Default 1024.
+    /// - Returns: Generated text response.
+    public func conversationSend(
+        audioData: [Data] = [],
+        audioFormat: AudioFormat = .wav,
+        imagesData: [Data] = [],
+        prompt: String,
+        maxImageDimension: Int = 1024
+    ) async throws -> String {
+        try ensureReady()
+
+        // Prepare media files
+        var tempURLs: [URL] = []
+        var audioPaths: [String] = []
+        var imagePaths: [String] = []
+
+        do {
+            for (i, data) in audioData.enumerated() {
+                guard !data.isEmpty else {
+                    throw LiteRTLMError.inferenceFailure("Audio data \(i + 1) is empty")
+                }
+                let url = Self.makeTempURL(extension: audioFormat.rawValue)
+                try data.write(to: url)
+                tempURLs.append(url)
+                audioPaths.append(url.path)
+            }
+            for (i, data) in imagesData.enumerated() {
+                guard let jpegData = Self.prepareImageForVision(data, maxDimension: maxImageDimension) else {
+                    throw LiteRTLMError.inferenceFailure("Failed to convert image \(i + 1) to JPEG")
+                }
+                let url = Self.makeTempURL(extension: "jpg")
+                try jpegData.write(to: url)
+                tempURLs.append(url)
+                imagePaths.append(url.path)
+            }
+        } catch {
+            Self.cleanupTempFiles(tempURLs)
+            throw error
+        }
+
+        let messageJSON = Self.buildMultimodalMessageJSON(
+            audioPaths: audioPaths, imagePaths: imagePaths, text: prompt
+        )
+
+        let urlsToCleanup = tempURLs
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, any Error>) in
+            self.inferenceQueue.async { [self, urlsToCleanup] in
+                defer { Self.cleanupTempFiles(urlsToCleanup) }
+                do {
+                    guard let conversation = self.multimodalConversation else {
+                        throw LiteRTLMError.inferenceFailure(
+                            "No persistent conversation open — call openConversation() first"
+                        )
+                    }
+
+                    guard let response = messageJSON.withCString({ msgPtr in
+                        litert_lm_conversation_send_message(conversation, msgPtr, nil)
+                    }) else {
+                        throw LiteRTLMError.inferenceFailure("Conversation returned no response")
+                    }
+                    defer { litert_lm_json_response_delete(response) }
+
+                    guard let responsePtr = litert_lm_json_response_get_string(response) else {
+                        throw LiteRTLMError.inferenceFailure("Response string is NULL")
+                    }
+
+                    let result = Self.extractTextFromConversationResponse(String(cString: responsePtr))
+                    continuation.resume(returning: result)
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Close the persistent multimodal conversation, freeing KV cache memory.
+    public func closeConversation() {
+        inferenceQueue.async { [self] in
+            guard multimodalConversation != nil else { return }
+            if let c = multimodalConversation {
+                litert_lm_conversation_delete(c)
+                multimodalConversation = nil
+            }
+            if let c = multimodalConvConfig {
+                litert_lm_conversation_config_delete(c)
+                multimodalConvConfig = nil
+            }
+            if let c = multimodalSessionConfig {
+                litert_lm_session_config_delete(c)
+                multimodalSessionConfig = nil
+            }
+            Self.log.info("Persistent multimodal conversation closed")
         }
     }
 
