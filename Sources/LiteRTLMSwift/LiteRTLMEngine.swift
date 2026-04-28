@@ -52,6 +52,30 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     private var engine: OpaquePointer?  // LiteRtLmEngine*
     private let inferenceQueue = DispatchQueue(label: "com.litertlm.inference", qos: .userInitiated)
 
+    /// Background queue used to invoke long-running, blocking C streaming calls.
+    /// Concurrent + userInitiated so multiple streams can be in flight on different
+    /// engines, while still being serialized against `inferenceQueue` for handle access.
+    private static let streamingExecQueue = DispatchQueue(
+        label: "com.litertlm.streaming.exec", qos: .userInitiated, attributes: .concurrent
+    )
+
+    /// Tracks the currently active conversation pointer (if any) so `cancel()` can
+    /// dispatch `litert_lm_conversation_cancel_process` from any thread without
+    /// blocking on `inferenceQueue`. Mutated only under `inferenceQueue` sync.
+    /// Reads from `cancel()` use an os_unfair_lock for atomicity.
+    private var activeConversation: OpaquePointer?
+
+    /// Set true when `cancel()` is called; checked by streaming callbacks and
+    /// inference loops to bail out early. Reset at the start of each new
+    /// inference call.
+    private var cancellationRequested: Bool = false
+
+    /// Lock guarding `activeConversation` and `cancellationRequested` so that
+    /// `cancel()` (callable from any thread) can safely read/write them without
+    /// hopping onto `inferenceQueue` (which may itself be blocked running a
+    /// streaming generate call).
+    private let cancelStateLock = NSLock()
+
     private static let log = Logger(subsystem: "LiteRTLMSwift", category: "Engine")
 
     // MARK: - Init
@@ -65,6 +89,19 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         self.backend = backend
     }
 
+    /// Releases all C handles synchronously.
+    ///
+    /// **Lifecycle contract:** consumers SHOULD call `unload()` before releasing
+    /// the last strong reference. If the engine is still loaded at deinit, this
+    /// runs a `inferenceQueue.sync` cleanup so it serializes against any
+    /// in-flight inference. This is safe because `inferenceQueue` blocks
+    /// retain `self` via `[self]`, so deinit cannot fire while a queue block is
+    /// executing — there is no path on which deinit would re-enter
+    /// `inferenceQueue` and deadlock.
+    ///
+    /// In DEBUG builds we log a warning if `unload()` was not called explicitly,
+    /// because that's almost always a leak of the multi-GB model weights up to
+    /// the next ARC cycle.
     deinit {
         let eng = engine
         let ses = chatSession
@@ -72,16 +109,21 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         let conv = multimodalConversation
         let convCfg = multimodalConvConfig
         let convSesCfg = multimodalSessionConfig
-        let queue = inferenceQueue
-        if eng != nil || ses != nil || conv != nil {
-            queue.async {
-                if let s = ses { litert_lm_session_delete(s) }
-                if let c = sesCfg { litert_lm_session_config_delete(c) }
-                if let c = conv { litert_lm_conversation_delete(c) }
-                if let c = convCfg { litert_lm_conversation_config_delete(c) }
-                if let c = convSesCfg { litert_lm_session_config_delete(c) }
-                if let e = eng { litert_lm_engine_delete(e) }
-            }
+        guard eng != nil || ses != nil || conv != nil else { return }
+
+        #if DEBUG
+        Self.log.warning("LiteRTLMEngine deinit while still loaded — call unload() first to release model memory deterministically.")
+        #endif
+
+        // Serialize against any in-flight inference. This is safe: queue blocks
+        // capture `[self]`, so deinit cannot run while a block is executing.
+        inferenceQueue.sync {
+            if let s = ses { litert_lm_session_delete(s) }
+            if let c = sesCfg { litert_lm_session_config_delete(c) }
+            if let c = conv { litert_lm_conversation_delete(c) }
+            if let c = convCfg { litert_lm_conversation_config_delete(c) }
+            if let c = convSesCfg { litert_lm_session_config_delete(c) }
+            if let e = eng { litert_lm_engine_delete(e) }
         }
     }
 
@@ -121,8 +163,11 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
                         litert_lm_engine_settings_set_max_num_tokens(settings, 4096)
 
-                        let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-                            .appendingPathComponent("litertlm_cache").path
+                        let cacheBase: URL = FileManager.default
+                            .urls(for: .cachesDirectory, in: .userDomainMask)
+                            .first
+                            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+                        let cacheDir = cacheBase.appendingPathComponent("litertlm_cache").path
                         try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
                         litert_lm_engine_settings_set_cache_dir(settings, cacheDir)
 
@@ -183,6 +228,62 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
         status = .notLoaded
         Self.log.info("Model unloaded")
+    }
+
+    // MARK: - Cancellation
+
+    /// Cancel the in-flight inference, if any.
+    ///
+    /// Cancellation contract:
+    /// - Safe to call from any thread, including from inside an `await` site
+    ///   on the same task that started the inference.
+    /// - For multimodal/Conversation inferences, this calls
+    ///   `litert_lm_conversation_cancel_process` which signals the C runtime to
+    ///   stop generation early. The pending `await` will then unwind via the
+    ///   normal `isFinal` callback path.
+    /// - For text-only Session streaming, the C runtime does not expose a
+    ///   cancel symbol. We mark the in-flight stream cancelled so the
+    ///   `AsyncThrowingStream` finishes immediately on the consumer side; the
+    ///   underlying C generate loop continues to completion in the background
+    ///   but its tokens are dropped. Tokens already buffered before cancel
+    ///   may still be delivered.
+    /// - Calling `cancel()` when no inference is active is a no-op.
+    /// - This method does NOT throw; it always succeeds.
+    public func cancel() {
+        cancelStateLock.lock()
+        cancellationRequested = true
+        let conv = activeConversation
+        cancelStateLock.unlock()
+
+        if let conv {
+            // The C cancel call is itself thread-safe per the engine.h contract.
+            litert_lm_conversation_cancel_process(conv)
+            Self.log.info("Cancellation requested (conversation)")
+        } else {
+            Self.log.info("Cancellation requested (no active conversation; session stream will be dropped on consumer side)")
+        }
+    }
+
+    /// Snapshot the cancellation flag in a thread-safe way.
+    fileprivate func isCancelled() -> Bool {
+        cancelStateLock.lock()
+        defer { cancelStateLock.unlock() }
+        return cancellationRequested
+    }
+
+    /// Reset cancellation state at the start of a new inference.
+    fileprivate func resetCancellationState() {
+        cancelStateLock.lock()
+        cancellationRequested = false
+        cancelStateLock.unlock()
+    }
+
+    /// Register the currently active conversation pointer so `cancel()` can
+    /// reach it from any thread. Pass `nil` to unregister.
+    fileprivate func setActiveConversation(_ conv: OpaquePointer?) {
+        cancelStateLock.lock()
+        activeConversation = conv
+        cancelStateLock.unlock()
     }
 
     // MARK: - Text Generation (Session API)
@@ -631,10 +732,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             "No persistent conversation open — call openConversation() first"
                         )
                     }
+                    self.resetCancellationState()
+                    self.setActiveConversation(conversation)
+                    defer { self.setActiveConversation(nil) }
 
                     guard let response = messageJSON.withCString({ msgPtr in
                         litert_lm_conversation_send_message(conversation, msgPtr, nil)
                     }) else {
+                        if self.isCancelled() {
+                            throw LiteRTLMError.cancelled
+                        }
                         throw LiteRTLMError.inferenceFailure("Conversation returned no response")
                     }
                     defer { litert_lm_json_response_delete(response) }
@@ -681,14 +788,32 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// - Returns: An `AsyncThrowingStream` yielding text chunks.
     public func sessionGenerateStreaming(input: String) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
-            self.inferenceQueue.async { [self] in
-                guard let session = self.chatSession else {
-                    continuation.finish(throwing: LiteRTLMError.inferenceFailure("No persistent session open — call openSession() first"))
-                    return
-                }
+            // Snapshot the session pointer under the inference queue (handle guard),
+            // then run the blocking C streaming call on a dedicated background queue
+            // so we do NOT hold `inferenceQueue` while waiting on the semaphore. This
+            // avoids deadlocking if the C runtime ever dispatches its callback onto
+            // the same queue.
+            let session: OpaquePointer? = self.inferenceQueue.sync { self.chatSession }
+            guard let session else {
+                continuation.finish(throwing: LiteRTLMError.inferenceFailure("No persistent session open — call openSession() first"))
+                return
+            }
 
+            self.resetCancellationState()
+
+            // Wire up Task cancellation: when the consumer cancels the parent Task
+            // (or the AsyncThrowingStream is dropped), forward to engine.cancel().
+            continuation.onTermination = { [weak self] _ in
+                self?.cancel()
+            }
+
+            Self.streamingExecQueue.async { [self] in
                 let streamDone = DispatchSemaphore(value: 0)
-                let state = StreamCallbackState(continuation: continuation, doneSemaphore: streamDone)
+                let state = StreamCallbackState(
+                    continuation: continuation,
+                    doneSemaphore: streamDone,
+                    isCancelled: { [weak self] in self?.isCancelled() ?? false }
+                )
                 let statePtr = Unmanaged.passRetained(state).toOpaque()
 
                 let result = input.withCString { textPtr -> Int32 in
@@ -699,33 +824,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     )
                     return litert_lm_session_generate_content_stream(
                         session, &inputData, 1,
-                        { callbackData, chunk, isFinal, errorMsg in
-                            guard let cbData = callbackData else { return }
-                            let st = Unmanaged<StreamCallbackState>.fromOpaque(cbData)
-                                .takeUnretainedValue()
-
-                            let errorMessage: String? = {
-                                guard let errorMsg else { return nil }
-                                let msg = String(cString: errorMsg)
-                                return msg.isEmpty ? nil : msg
-                            }()
-
-                            if let chunk, errorMessage == nil {
-                                let text = String(cString: chunk)
-                                if !text.isEmpty { st.continuation.yield(text) }
-                            }
-
-                            if isFinal || errorMessage != nil {
-                                if let error = errorMessage {
-                                    st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
-                                } else {
-                                    st.continuation.finish()
-                                }
-                                let semaphore = st.doneSemaphore
-                                Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
-                                semaphore.signal()
-                            }
-                        },
+                        Self.streamCallback,
                         statePtr
                     )
                 }
@@ -737,7 +836,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 }
 
                 streamDone.wait()
-                self.logSessionBenchmark(session)
+                // Re-enter inferenceQueue ONLY for handle-touching post-work
+                // (benchmark read). This keeps the streaming queue free.
+                self.inferenceQueue.sync { self.logSessionBenchmark(session) }
             }
         }
     }
@@ -794,75 +895,80 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         maxTokens: Int32
     ) -> AsyncThrowingStream<String, Error> {
         AsyncThrowingStream { continuation in
-            self.inferenceQueue.async { [self] in
+            // Phase 1: handle-guarded session creation on inferenceQueue.
+            let creation: Result<(OpaquePointer, OpaquePointer), Error> = self.inferenceQueue.sync {
                 do {
                     try self.ensureReady()
                     guard let eng = self.engine else {
-                        continuation.finish(throwing: LiteRTLMError.modelNotLoaded)
-                        return
+                        return .failure(LiteRTLMError.modelNotLoaded)
                     }
-
-                    let (session, sessionConfig) = try self.createSession(
+                    let pair = try self.createSession(
                         engine: eng, temperature: temperature, maxTokens: maxTokens
                     )
+                    return .success(pair)
+                } catch {
+                    return .failure(error)
+                }
+            }
 
-                    let streamDone = DispatchSemaphore(value: 0)
-                    let state = StreamCallbackState(continuation: continuation, doneSemaphore: streamDone)
-                    let statePtr = Unmanaged.passRetained(state).toOpaque()
+            let session: OpaquePointer
+            let sessionConfig: OpaquePointer
+            switch creation {
+            case .failure(let err):
+                continuation.finish(throwing: err)
+                return
+            case .success(let pair):
+                session = pair.0
+                sessionConfig = pair.1
+            }
 
-                    let result = prompt.withCString { textPtr -> Int32 in
-                        var input = InputData(
-                            type: kInputText,
-                            data: UnsafeRawPointer(textPtr),
-                            size: strlen(textPtr)
-                        )
-                        return litert_lm_session_generate_content_stream(
-                            session, &input, 1,
-                            { callbackData, chunk, isFinal, errorMsg in
-                                guard let cbData = callbackData else { return }
-                                let st = Unmanaged<StreamCallbackState>.fromOpaque(cbData)
-                                    .takeUnretainedValue()
+            self.resetCancellationState()
 
-                                let errorMessage: String? = {
-                                    guard let errorMsg else { return nil }
-                                    let msg = String(cString: errorMsg)
-                                    return msg.isEmpty ? nil : msg
-                                }()
+            continuation.onTermination = { [weak self] _ in
+                self?.cancel()
+            }
 
-                                if let chunk, errorMessage == nil {
-                                    let text = String(cString: chunk)
-                                    if !text.isEmpty { st.continuation.yield(text) }
-                                }
+            // Phase 2: blocking generate on a dedicated background queue. Do NOT
+            // hold `inferenceQueue` here — the C streaming callback may post on
+            // the same queue, which would deadlock.
+            Self.streamingExecQueue.async { [self] in
+                let streamDone = DispatchSemaphore(value: 0)
+                let state = StreamCallbackState(
+                    continuation: continuation,
+                    doneSemaphore: streamDone,
+                    isCancelled: { [weak self] in self?.isCancelled() ?? false }
+                )
+                let statePtr = Unmanaged.passRetained(state).toOpaque()
 
-                                if isFinal || errorMessage != nil {
-                                    if let error = errorMessage {
-                                        st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
-                                    } else {
-                                        st.continuation.finish()
-                                    }
-                                    let semaphore = st.doneSemaphore
-                                    Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
-                                    semaphore.signal()
-                                }
-                            },
-                            statePtr
-                        )
-                    }
+                let result = prompt.withCString { textPtr -> Int32 in
+                    var input = InputData(
+                        type: kInputText,
+                        data: UnsafeRawPointer(textPtr),
+                        size: strlen(textPtr)
+                    )
+                    return litert_lm_session_generate_content_stream(
+                        session, &input, 1,
+                        Self.streamCallback,
+                        statePtr
+                    )
+                }
 
-                    if result != 0 {
-                        Unmanaged<StreamCallbackState>.fromOpaque(statePtr).release()
+                if result != 0 {
+                    Unmanaged<StreamCallbackState>.fromOpaque(statePtr).release()
+                    self.inferenceQueue.sync {
                         litert_lm_session_delete(session)
                         litert_lm_session_config_delete(sessionConfig)
-                        continuation.finish(throwing: LiteRTLMError.inferenceFailure("Failed to start stream"))
-                        return
                     }
+                    continuation.finish(throwing: LiteRTLMError.inferenceFailure("Failed to start stream"))
+                    return
+                }
 
-                    streamDone.wait()
+                streamDone.wait()
+                // Phase 3: handle teardown back on inferenceQueue.
+                self.inferenceQueue.sync {
                     self.logSessionBenchmark(session)
                     litert_lm_session_delete(session)
                     litert_lm_session_config_delete(sessionConfig)
-                } catch {
-                    continuation.finish(throwing: error)
                 }
             }
         }
@@ -973,7 +1079,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         litert_lm_session_config_delete(sessionConfig)
                         throw LiteRTLMError.inferenceFailure("Failed to create conversation")
                     }
+                    self.resetCancellationState()
+                    self.setActiveConversation(conversation)
                     defer {
+                        self.setActiveConversation(nil)
                         litert_lm_conversation_delete(conversation)
                         litert_lm_conversation_config_delete(convConfig)
                         litert_lm_session_config_delete(sessionConfig)
@@ -982,6 +1091,9 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     guard let response = messageJSON.withCString({ msgPtr in
                         litert_lm_conversation_send_message(conversation, msgPtr, nil)
                     }) else {
+                        if self.isCancelled() {
+                            throw LiteRTLMError.cancelled
+                        }
                         throw LiteRTLMError.inferenceFailure("Conversation returned no response")
                     }
                     defer { litert_lm_json_response_delete(response) }
@@ -1116,11 +1228,70 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 private final class StreamCallbackState: @unchecked Sendable {
     let continuation: AsyncThrowingStream<String, Error>.Continuation
     let doneSemaphore: DispatchSemaphore
+    let isCancelled: () -> Bool
+    /// Set once the consumer has been finished (cancelled or completed) so the
+    /// callback drops further chunks instead of yielding into a dead continuation.
+    var finished: Bool = false
 
     init(continuation: AsyncThrowingStream<String, Error>.Continuation,
-         doneSemaphore: DispatchSemaphore) {
+         doneSemaphore: DispatchSemaphore,
+         isCancelled: @escaping () -> Bool = { false }) {
         self.continuation = continuation
         self.doneSemaphore = doneSemaphore
+        self.isCancelled = isCancelled
+    }
+}
+
+extension LiteRTLMEngine {
+    /// Shared C-callable streaming callback.
+    ///
+    /// Honors cancellation:
+    /// - If `state.isCancelled()` returns true, finish the continuation with
+    ///   `LiteRTLMError.cancelled` immediately and signal done so the caller
+    ///   unblocks. Subsequent invocations are no-ops because `state.finished`
+    ///   is set.
+    static let streamCallback: @convention(c) (
+        UnsafeMutableRawPointer?, UnsafePointer<CChar>?, Bool, UnsafePointer<CChar>?
+    ) -> Void = { callbackData, chunk, isFinal, errorMsg in
+        guard let cbData = callbackData else { return }
+        let st = Unmanaged<StreamCallbackState>.fromOpaque(cbData).takeUnretainedValue()
+
+        if st.finished { return }
+
+        let errorMessage: String? = {
+            guard let errorMsg else { return nil }
+            let msg = String(cString: errorMsg)
+            return msg.isEmpty ? nil : msg
+        }()
+
+        // Cancellation short-circuit: bail out as soon as the consumer asks.
+        if st.isCancelled() && !isFinal && errorMessage == nil {
+            st.finished = true
+            st.continuation.finish(throwing: LiteRTLMError.cancelled)
+            let semaphore = st.doneSemaphore
+            Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
+            semaphore.signal()
+            return
+        }
+
+        if let chunk, errorMessage == nil {
+            let text = String(cString: chunk)
+            if !text.isEmpty { st.continuation.yield(text) }
+        }
+
+        if isFinal || errorMessage != nil {
+            st.finished = true
+            if let error = errorMessage {
+                st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
+            } else if st.isCancelled() {
+                st.continuation.finish(throwing: LiteRTLMError.cancelled)
+            } else {
+                st.continuation.finish()
+            }
+            let semaphore = st.doneSemaphore
+            Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
+            semaphore.signal()
+        }
     }
 }
 
@@ -1131,6 +1302,9 @@ public enum LiteRTLMError: LocalizedError {
     case modelNotLoaded
     case engineCreationFailed(String)
     case inferenceFailure(String)
+    /// Inference was cancelled by the caller via `LiteRTLMEngine.cancel()` or
+    /// by Task cancellation propagating to the streaming continuation.
+    case cancelled
 
     public var errorDescription: String? {
         switch self {
@@ -1142,6 +1316,8 @@ public enum LiteRTLMError: LocalizedError {
             "Failed to create LiteRT-LM engine: \(detail)"
         case .inferenceFailure(let detail):
             "LiteRT-LM inference failed: \(detail)"
+        case .cancelled:
+            "LiteRT-LM inference was cancelled"
         }
     }
 }

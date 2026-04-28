@@ -276,7 +276,8 @@ struct EngineView: View {
 |--------|-------------|
 | `init(modelPath:backend:)` | Create engine. `backend`: `"cpu"` (default, recommended) or `"gpu"` (experimental, Metal) |
 | `load()` | Load the `.litertlm` model. Call once, reuse across inferences |
-| `unload()` | Free model memory |
+| `unload()` | Free model memory. **Call this before releasing the last strong reference** — `deinit` will fall back to a synchronous cleanup but a DEBUG warning is logged if the engine is still loaded at deinit |
+| `cancel()` | Cancel an in-flight inference. Thread-safe. For multimodal/Conversation inferences this calls `litert_lm_conversation_cancel_process`; for text-only Session streams the consumer's `AsyncThrowingStream` finishes with `LiteRTLMError.cancelled` immediately (the underlying C decode runs to completion in the background but its tokens are dropped). Also wired up to Swift `Task` cancellation — `task.cancel()` on the parent of a streaming call will trigger `cancel()` automatically |
 | `generate(prompt:temperature:maxTokens:)` | One-shot text generation. Prompt must use Gemma turn markers |
 | `generateStreaming(prompt:temperature:maxTokens:)` | Streaming text generation |
 | `vision(imageData:prompt:temperature:maxTokens:maxImageDimension:)` | Single-image understanding. Plain text prompt |
