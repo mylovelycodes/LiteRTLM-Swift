@@ -48,6 +48,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private let modelPath: URL
     private let backend: String
+    private let visionBackend: String?
+    private let audioBackend: String?
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
     private let inferenceQueue = DispatchQueue(label: "com.litertlm.inference", qos: .userInitiated)
@@ -60,9 +62,13 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// - Parameters:
     ///   - modelPath: Path to the `.litertlm` model file on disk.
     ///   - backend: Compute backend — `"cpu"` or `"gpu"` (GPU uses Metal on iOS).
-    public init(modelPath: URL, backend: String = "cpu") {
+    ///   - visionBackend: Optional vision backend. Pass `nil` to leave the vision executor disabled.
+    ///   - audioBackend: Optional audio backend. Pass `nil` to leave the audio executor disabled.
+    public init(modelPath: URL, backend: String = "cpu", visionBackend: String? = nil, audioBackend: String? = nil) {
         self.modelPath = modelPath
         self.backend = backend
+        self.visionBackend = visionBackend
+        self.audioBackend = audioBackend
     }
 
     deinit {
@@ -98,6 +104,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
         let path = modelPath.path
         let backendStr = self.backend
+        let visionBackendStr = self.visionBackend
+        let audioBackendStr = self.audioBackend
         let startTime = CFAbsoluteTimeGetCurrent()
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -111,11 +119,17 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             let createdEngine = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<OpaquePointer, any Error>) in
                 self.inferenceQueue.async {
                     do {
-                        litert_lm_set_min_log_level(1)
+                        litert_lm_set_min_log_level(0)
 
-                        guard let settings = litert_lm_engine_settings_create(
-                            path, backendStr, backendStr, backendStr
-                        ) else {
+                        let settings = Self.withOptionalCString(visionBackendStr) { visionBackendPtr in
+                            Self.withOptionalCString(audioBackendStr) { audioBackendPtr in
+                                litert_lm_engine_settings_create(
+                                    path, backendStr, visionBackendPtr, audioBackendPtr
+                                )
+                            }
+                        }
+
+                        guard let settings else {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
 
@@ -151,6 +165,19 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             Self.log.error("\(msg)")
             status = .error(msg)
             throw error
+        }
+    }
+
+    private static func withOptionalCString<Result>(
+        _ string: String?,
+        _ body: (UnsafePointer<CChar>?) -> Result
+    ) -> Result {
+        guard let string else {
+            return body(nil)
+        }
+
+        return string.withCString { pointer in
+            body(pointer)
         }
     }
 
@@ -537,17 +564,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     }
                     litert_lm_session_config_set_max_output_tokens(sessionConfig, Int32(maxTokens))
                     var samplerParams = LiteRtLmSamplerParams(
-                        type: kTopP, top_k: 40, top_p: 0.95,
+                        type: kLiteRtLmSamplerTypeTopP, top_k: 40, top_p: 0.95,
                         temperature: temperature, seed: 0
                     )
                     litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
 
-                    guard let convConfig = litert_lm_conversation_config_create(
-                        eng, sessionConfig, nil, nil, nil, false
-                    ) else {
+                    guard let convConfig = litert_lm_conversation_config_create() else {
                         litert_lm_session_config_delete(sessionConfig)
                         throw LiteRTLMError.inferenceFailure("Failed to create conversation config")
                     }
+                    litert_lm_conversation_config_set_session_config(convConfig, sessionConfig)
 
                     guard let conversation = litert_lm_conversation_create(eng, convConfig) else {
                         litert_lm_conversation_config_delete(convConfig)
@@ -692,8 +718,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 let statePtr = Unmanaged.passRetained(state).toOpaque()
 
                 let result = input.withCString { textPtr -> Int32 in
-                    var inputData = InputData(
-                        type: kInputText,
+                    var inputData = LiteRtLmInputData(
+                        type: kLiteRtLmInputDataTypeText,
                         data: UnsafeRawPointer(textPtr),
                         size: strlen(textPtr)
                     )
@@ -763,8 +789,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     }
 
                     let output = prompt.withCString { textPtr -> String? in
-                        var input = InputData(
-                            type: kInputText,
+                        var input = LiteRtLmInputData(
+                            type: kLiteRtLmInputDataTypeText,
                             data: UnsafeRawPointer(textPtr),
                             size: strlen(textPtr)
                         )
@@ -811,8 +837,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     let statePtr = Unmanaged.passRetained(state).toOpaque()
 
                     let result = prompt.withCString { textPtr -> Int32 in
-                        var input = InputData(
-                            type: kInputText,
+                        var input = LiteRtLmInputData(
+                            type: kLiteRtLmInputDataTypeText,
                             data: UnsafeRawPointer(textPtr),
                             size: strlen(textPtr)
                         )
@@ -885,7 +911,7 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
         litert_lm_session_config_set_max_output_tokens(sessionConfig, maxTokens)
         var samplerParams = LiteRtLmSamplerParams(
-            type: kTopP, top_k: 40, top_p: 0.95,
+            type: kLiteRtLmSamplerTypeTopP, top_k: 40, top_p: 0.95,
             temperature: temperature, seed: 0
         )
         litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
@@ -956,17 +982,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     }
                     litert_lm_session_config_set_max_output_tokens(sessionConfig, Int32(maxTokens))
                     var samplerParams = LiteRtLmSamplerParams(
-                        type: kTopP, top_k: 40, top_p: 0.95,
+                        type: kLiteRtLmSamplerTypeTopP, top_k: 40, top_p: 0.95,
                         temperature: temperature, seed: 0
                     )
                     litert_lm_session_config_set_sampler_params(sessionConfig, &samplerParams)
 
-                    guard let convConfig = litert_lm_conversation_config_create(
-                        eng, sessionConfig, nil, nil, nil, false
-                    ) else {
+                    guard let convConfig = litert_lm_conversation_config_create() else {
                         litert_lm_session_config_delete(sessionConfig)
                         throw LiteRTLMError.inferenceFailure("Failed to create conversation config")
                     }
+                    litert_lm_conversation_config_set_session_config(convConfig, sessionConfig)
 
                     guard let conversation = litert_lm_conversation_create(eng, convConfig) else {
                         litert_lm_conversation_config_delete(convConfig)
