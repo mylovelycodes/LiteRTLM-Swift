@@ -6,7 +6,7 @@
 	<dict>
 		<key>Headers/engine.h</key>
 		<data>
-		YgNQHb3d5ZSMt+OArqkf2XKjFyA=
+		mTcKAuL70mrojY4R0ZzEmZjB8oc=
 		</data>
 		<key>Headers/litert_lm_logging.h</key>
 		<data>
@@ -20,6 +20,18 @@
 		<data>
 		V1NzPEqLrtyn3YcAATVkSgRbnMM=
 		</data>
+		<key>libGemmaModelConstraintProvider.dylib</key>
+		<data>
+		V4Fo9nVo5nG2E7636P1njH+IlM4=
+		</data>
+		<key>libLiteRt.dylib</key>
+		<data>
+		C7KlqlcsdWISydOXWRrMD7ELnNQ=
+		</data>
+		<key>libLiteRtMetalAccelerator.dylib</key>
+		<data>
+		AI+kjdOlUvWG7WSEIx+HIcoIHN4=
+		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
@@ -27,7 +39,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			ys7h0Yqp4sIq642i/BV2slwD1xBOUxmgNSxkpXu2kek=
+			6pF9nYoNONqCFm4xc/SNTTCZM2paq7MSxETM9G4PT6Q=
 			</data>
 		</dict>
 		<key>Headers/litert_lm_logging.h</key>
@@ -42,6 +54,27 @@
 			<key>hash2</key>
 			<data>
 			6+p8hUMjrBlqco/tt8gCqzieXnRSsXGol/B0+UIIP+Y=
+			</data>
+		</dict>
+		<key>libGemmaModelConstraintProvider.dylib</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			vtZxZqmA38CY5e0XON+HXWxNqhX9z0a30yH3oV0tfiA=
+			</data>
+		</dict>
+		<key>libLiteRt.dylib</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			KVEBwu41GjbP0XTf7ffI9KSv3ANZJGQdIi97r6jqRNg=
+			</data>
+		</dict>
+		<key>libLiteRtMetalAccelerator.dylib</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			orbGlsLUjketz8IdCuu+ncnEHg+lsaWMEPWFCfkP9d0=
 			</data>
 		</dict>
 	</dict>

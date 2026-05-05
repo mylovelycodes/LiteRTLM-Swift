@@ -6,7 +6,7 @@
 	<dict>
 		<key>Headers/engine.h</key>
 		<data>
-		YgNQHb3d5ZSMt+OArqkf2XKjFyA=
+		mTcKAuL70mrojY4R0ZzEmZjB8oc=
 		</data>
 		<key>Headers/litert_lm_logging.h</key>
 		<data>
@@ -22,7 +22,19 @@
 		</data>
 		<key>libGemmaModelConstraintProvider.dylib</key>
 		<data>
-		dIZ4g2tJiH/zWGQFpkX2z9R0cqg=
+		7LiL1rv4FZ2xFWJm94MgT4Uo4JI=
+		</data>
+		<key>libLiteRt.dylib</key>
+		<data>
+		jwL3fl4HBhii3KpMaXAQni+OuY8=
+		</data>
+		<key>libLiteRtMetalAccelerator.dylib</key>
+		<data>
+		e0KeLvh4JyIp7edqb1dXgvnMYjQ=
+		</data>
+		<key>libLiteRtTopKMetalSampler.dylib</key>
+		<data>
+		lUk2SPPZgx8sH/zU/35vvuovCdc=
 		</data>
 	</dict>
 	<key>files2</key>
@@ -31,7 +43,7 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			ys7h0Yqp4sIq642i/BV2slwD1xBOUxmgNSxkpXu2kek=
+			6pF9nYoNONqCFm4xc/SNTTCZM2paq7MSxETM9G4PT6Q=
 			</data>
 		</dict>
 		<key>Headers/litert_lm_logging.h</key>
@@ -52,7 +64,28 @@
 		<dict>
 			<key>hash2</key>
 			<data>
-			rtXtiLGFv8fdOoM+1rfipe48qjByFGjYx44CvmARde0=
+			rBbnafszdXrNCobHpkWE9f/hDvuDrVt4L6EQu+QT0/0=
+			</data>
+		</dict>
+		<key>libLiteRt.dylib</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			9/sEGH77Ir5tR4YFNzlcowogveaWc1onjBhxH339Nec=
+			</data>
+		</dict>
+		<key>libLiteRtMetalAccelerator.dylib</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			pWp5z9Go/5xUeR32nKUMD/Ri8XwK12gy/jWGA/KwQao=
+			</data>
+		</dict>
+		<key>libLiteRtTopKMetalSampler.dylib</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			HU5mSpbKWJrvQRipBqTVQU/5FMf2RIFtDKifq69A+IM=
 			</data>
 		</dict>
 	</dict>

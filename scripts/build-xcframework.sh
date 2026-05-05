@@ -146,6 +146,53 @@ if [ -f "$LITERT_LM_DIR/bazel-bin/c/libGemmaModelConstraintProvider.dylib" ]; th
 fi
 
 # ---------------------------------------------------------------------------
+# 3b. Collect prebuilt GPU dylibs from upstream
+# ---------------------------------------------------------------------------
+# The LiteRT-LM repo ships prebuilt Metal GPU dylibs that are required for
+# GPU backend support on iOS. These are dynamically loaded at runtime.
+
+PREBUILT_DEVICE_DIR="$LITERT_LM_DIR/prebuilt/ios_arm64"
+PREBUILT_SIM_DIR="$LITERT_LM_DIR/prebuilt/ios_sim_arm64"
+
+# Device GPU dylibs
+DEVICE_GPU_DYLIBS=()
+for DYLIB_NAME in libLiteRtTopKMetalSampler.dylib libLiteRtMetalAccelerator.dylib libLiteRt.dylib; do
+    if [ -f "$PREBUILT_DEVICE_DIR/$DYLIB_NAME" ]; then
+        cp "$PREBUILT_DEVICE_DIR/$DYLIB_NAME" "$WORK_DIR/${DYLIB_NAME%.dylib}-device.dylib"
+        DEVICE_GPU_DYLIBS+=("$WORK_DIR/${DYLIB_NAME%.dylib}-device.dylib")
+        info "Found prebuilt device GPU dylib: $DYLIB_NAME"
+    else
+        warn "Prebuilt device GPU dylib not found: $DYLIB_NAME (GPU may not work)"
+    fi
+done
+
+# Also grab prebuilt constraint provider if we didn't get one from the build
+if [ -z "$CONSTRAINT_DYLIB" ] && [ -f "$PREBUILT_DEVICE_DIR/libGemmaModelConstraintProvider.dylib" ]; then
+    CONSTRAINT_DYLIB="$WORK_DIR/libGemmaModelConstraintProvider.dylib"
+    cp "$PREBUILT_DEVICE_DIR/libGemmaModelConstraintProvider.dylib" "$CONSTRAINT_DYLIB"
+    info "Using prebuilt libGemmaModelConstraintProvider.dylib"
+fi
+
+# Simulator GPU dylibs (no Metal sampler on sim — no real GPU)
+SIM_GPU_DYLIBS=()
+for DYLIB_NAME in libLiteRtMetalAccelerator.dylib libLiteRt.dylib; do
+    if [ -f "$PREBUILT_SIM_DIR/$DYLIB_NAME" ]; then
+        cp "$PREBUILT_SIM_DIR/$DYLIB_NAME" "$WORK_DIR/${DYLIB_NAME%.dylib}-sim.dylib"
+        SIM_GPU_DYLIBS+=("$WORK_DIR/${DYLIB_NAME%.dylib}-sim.dylib")
+        info "Found prebuilt simulator GPU dylib: $DYLIB_NAME"
+    else
+        warn "Prebuilt simulator GPU dylib not found: $DYLIB_NAME"
+    fi
+done
+
+SIM_CONSTRAINT_DYLIB=""
+if [ -f "$PREBUILT_SIM_DIR/libGemmaModelConstraintProvider.dylib" ]; then
+    SIM_CONSTRAINT_DYLIB="$WORK_DIR/libGemmaModelConstraintProvider-sim.dylib"
+    cp "$PREBUILT_SIM_DIR/libGemmaModelConstraintProvider.dylib" "$SIM_CONSTRAINT_DYLIB"
+    info "Using prebuilt simulator libGemmaModelConstraintProvider.dylib"
+fi
+
+# ---------------------------------------------------------------------------
 # 4. Build for iOS simulator (arm64)
 # ---------------------------------------------------------------------------
 
@@ -174,7 +221,8 @@ MIN_IOS="13.0"
 package_framework() {
     local ARCH_NAME="$1"  # e.g. "ios-arm64"
     local DYLIB_PATH="$2"
-    local EXTRA_DYLIB="${3:-}"
+    shift 2
+    local EXTRA_DYLIBS=("$@")
     local FW_DIR="$WORK_DIR/$ARCH_NAME/$FRAMEWORK_NAME.framework"
 
     mkdir -p "$FW_DIR/Headers" "$FW_DIR/Modules"
@@ -185,10 +233,30 @@ package_framework() {
     # Fix install name
     install_name_tool -id "@rpath/$FRAMEWORK_NAME.framework/$FRAMEWORK_NAME" "$FW_DIR/$FRAMEWORK_NAME"
 
-    # Copy extra dylib if present
-    if [ -n "$EXTRA_DYLIB" ] && [ -f "$EXTRA_DYLIB" ]; then
-        cp "$EXTRA_DYLIB" "$FW_DIR/"
-    fi
+    # Copy extra dylibs (GPU samplers, accelerators, etc.)
+    for EXTRA in "${EXTRA_DYLIBS[@]}"; do
+        if [ -n "$EXTRA" ] && [ -f "$EXTRA" ]; then
+            # Strip the -device/-sim suffix to recover the original dylib name.
+            # Work files are named like: libFoo-device.dylib or libFoo-sim.dylib
+            # but some (e.g. constraint provider) have no suffix at all.
+            local BASENAME
+            BASENAME=$(basename "$EXTRA")
+            # Remove -device or -sim tag if present (before .dylib)
+            BASENAME=$(echo "$BASENAME" | sed -E 's/-(device|sim)\.dylib$/.dylib/')
+            cp "$EXTRA" "$FW_DIR/$BASENAME"
+            # Use codesign to clear existing signature first, then set install name.
+            # Some prebuilt dylibs lack header padding for longer install names,
+            # so we re-link with padding if install_name_tool fails.
+            if ! install_name_tool -id "@rpath/$FRAMEWORK_NAME.framework/$BASENAME" "$FW_DIR/$BASENAME" 2>/dev/null; then
+                warn "install_name_tool failed for $BASENAME (insufficient header padding), using codesign workaround"
+                # Strip the code signature to free header space, then retry
+                codesign --remove-signature "$FW_DIR/$BASENAME" 2>/dev/null || true
+                install_name_tool -id "@rpath/$FRAMEWORK_NAME.framework/$BASENAME" "$FW_DIR/$BASENAME"
+            fi
+            codesign --force --sign - "$FW_DIR/$BASENAME"
+            info "  Bundled $BASENAME"
+        fi
+    done
 
     # Copy headers
     cp "$HEADERS_DIR/engine.h" "$FW_DIR/Headers/"
@@ -226,20 +294,17 @@ MODULEMAP
 </plist>
 PLIST
 
-    # Ad-hoc code sign
+    # Ad-hoc code sign the main binary
     codesign --force --sign - "$FW_DIR/$FRAMEWORK_NAME"
-    if [ -n "$EXTRA_DYLIB" ] && [ -f "$FW_DIR/$(basename "$EXTRA_DYLIB")" ]; then
-        codesign --force --sign - "$FW_DIR/$(basename "$EXTRA_DYLIB")"
-    fi
 
     info "Packaged $ARCH_NAME framework at $FW_DIR"
 }
 
 info "Packaging device framework..."
-package_framework "ios-arm64" "$DEVICE_DYLIB" "$CONSTRAINT_DYLIB"
+package_framework "ios-arm64" "$DEVICE_DYLIB" "$CONSTRAINT_DYLIB" "${DEVICE_GPU_DYLIBS[@]}"
 
 info "Packaging simulator framework..."
-package_framework "ios-arm64-simulator" "$SIM_DYLIB" ""
+package_framework "ios-arm64-simulator" "$SIM_DYLIB" "$SIM_CONSTRAINT_DYLIB" "${SIM_GPU_DYLIBS[@]}"
 
 # ---------------------------------------------------------------------------
 # 6. Create xcframework
