@@ -142,6 +142,10 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
                         litert_lm_engine_settings_enable_benchmark(settings)
 
+                        // Enable Multi-Token Prediction (MTP) for >2x faster decode
+                        // Requires LiteRT-LM v0.11.0+ and a model with an MTP drafter section
+                        litert_lm_engine_settings_set_enable_speculative_decoding(settings, true)
+
                         guard let createdEngine = litert_lm_engine_create(settings) else {
                             litert_lm_engine_settings_delete(settings)
                             throw LiteRTLMError.engineCreationFailed("litert_lm_engine_create returned NULL")
@@ -502,6 +506,38 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         }
     }
 
+    // MARK: - Cancel APIs (Thread-Safe)
+
+    /// Cancel an in-progress session inference.
+    ///
+    /// Calls the C cancel API directly to interrupt the decode loop.
+    /// This is a no-op if no session is active. Safe to call from any thread —
+    /// the C cancel function is a thread-safe interrupt mechanism.
+    public func cancelSession() {
+        guard let session = chatSession else { return }
+        litert_lm_session_cancel_process(session)
+    }
+
+    /// Cancel an in-progress conversation inference.
+    ///
+    /// Calls the C cancel API directly to interrupt the decode loop.
+    /// This is a no-op if no conversation is active. Safe to call from any thread —
+    /// the C cancel function is a thread-safe interrupt mechanism.
+    public func cancelConversation() {
+        guard let conversation = multimodalConversation else { return }
+        litert_lm_conversation_cancel_process(conversation)
+    }
+
+    /// Whether a persistent text session is currently open.
+    public var hasActiveSession: Bool {
+        chatSession != nil
+    }
+
+    /// Whether a persistent multimodal conversation is currently open.
+    public var hasActiveConversation: Bool {
+        multimodalConversation != nil
+    }
+
     /// Close the persistent session, freeing KV cache memory.
     public func closeSession() {
         inferenceQueue.async { [self] in
@@ -674,6 +710,79 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 } catch {
                     continuation.resume(throwing: error)
                 }
+            }
+        }
+    }
+
+    /// Stream a message in the persistent multimodal conversation, yielding tokens as they arrive.
+    ///
+    /// Uses the same conversation KV cache as `conversationSend`, but delivers
+    /// tokens incrementally via an `AsyncThrowingStream` instead of waiting for
+    /// the full response.
+    ///
+    /// - Parameter prompt: Text prompt for this turn.
+    /// - Returns: An `AsyncThrowingStream` yielding text chunks as they are decoded.
+    public func conversationSendStreaming(
+        prompt: String
+    ) -> AsyncThrowingStream<String, Error> {
+        AsyncThrowingStream { continuation in
+            self.inferenceQueue.async { [self] in
+                guard let conversation = self.multimodalConversation else {
+                    continuation.finish(throwing: LiteRTLMError.inferenceFailure("No persistent conversation open — call openConversation() first"))
+                    return
+                }
+
+                let messageJSON = Self.buildMultimodalMessageJSON(
+                    audioPaths: [], imagePaths: [], text: prompt
+                )
+
+                let streamDone = DispatchSemaphore(value: 0)
+                let state = StreamCallbackState(continuation: continuation, doneSemaphore: streamDone)
+                let statePtr = Unmanaged.passRetained(state).toOpaque()
+
+                let result = messageJSON.withCString { msgPtr -> Int32 in
+                    litert_lm_conversation_send_message_stream(
+                        conversation, msgPtr, nil,
+                        { callbackData, chunk, isFinal, errorMsg in
+                            guard let cbData = callbackData else { return }
+                            let st = Unmanaged<StreamCallbackState>.fromOpaque(cbData)
+                                .takeUnretainedValue()
+
+                            let errorMessage: String? = {
+                                guard let errorMsg else { return nil }
+                                let msg = String(cString: errorMsg)
+                                return msg.isEmpty ? nil : msg
+                            }()
+
+                            if let chunk, errorMessage == nil {
+                                // The conversation API streams JSON chunks — extract text
+                                let chunkStr = String(cString: chunk)
+                                let text = LiteRTLMEngine.extractTextFromConversationResponse(chunkStr)
+                                if !text.isEmpty { st.continuation.yield(text) }
+                            }
+
+                            if isFinal || errorMessage != nil {
+                                if let error = errorMessage {
+                                    st.continuation.finish(throwing: LiteRTLMError.inferenceFailure(error))
+                                } else {
+                                    st.continuation.finish()
+                                }
+                                let semaphore = st.doneSemaphore
+                                Unmanaged<StreamCallbackState>.fromOpaque(cbData).release()
+                                semaphore.signal()
+                            }
+                        },
+                        statePtr
+                    )
+                }
+
+                if result != 0 {
+                    Unmanaged<StreamCallbackState>.fromOpaque(statePtr).release()
+                    continuation.finish(throwing: LiteRTLMError.inferenceFailure("Failed to start conversation stream"))
+                    return
+                }
+
+                streamDone.wait()
             }
         }
     }
@@ -976,6 +1085,21 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 }
                 do {
                     guard let eng = self.engine else { throw LiteRTLMError.modelNotLoaded }
+
+                    // Close any existing persistent conversation that might block
+                    // one-shot conversation creation (e.g., from AI Chat or Skills Chat)
+                    if let existingConv = self.multimodalConversation {
+                        litert_lm_conversation_delete(existingConv)
+                        self.multimodalConversation = nil
+                    }
+                    if let existingConfig = self.multimodalConvConfig {
+                        litert_lm_conversation_config_delete(existingConfig)
+                        self.multimodalConvConfig = nil
+                    }
+                    if let existingSessionConfig = self.multimodalSessionConfig {
+                        litert_lm_session_config_delete(existingSessionConfig)
+                        self.multimodalSessionConfig = nil
+                    }
 
                     guard let sessionConfig = litert_lm_session_config_create() else {
                         throw LiteRTLMError.inferenceFailure("Failed to create session config")
