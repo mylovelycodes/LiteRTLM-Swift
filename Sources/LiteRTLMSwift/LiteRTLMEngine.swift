@@ -48,6 +48,16 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
     private let modelPath: URL
     private let backend: String
+    /// Optional vision encoder backend ("cpu" or "gpu"). When nil, no vision
+    /// executor is initialized. Passing a non-nil value with a model that
+    /// has no vision section will cause engine init to fail in the C++
+    /// runtime, so only set this when the loaded `.litertlm` actually
+    /// contains a vision encoder (e.g. Gemma 4 vision variant).
+    private let visionBackend: String?
+    /// Optional audio encoder backend ("cpu" or "gpu"). Same constraint as
+    /// `visionBackend` — only set for `.litertlm` files that bundle an audio
+    /// encoder.
+    private let audioBackend: String?
 
     private var engine: OpaquePointer?  // LiteRtLmEngine*
     private let inferenceQueue = DispatchQueue(label: "com.litertlm.inference", qos: .userInitiated)
@@ -60,9 +70,23 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// - Parameters:
     ///   - modelPath: Path to the `.litertlm` model file on disk.
     ///   - backend: Compute backend — `"cpu"` or `"gpu"` (GPU uses Metal on iOS).
-    public init(modelPath: URL, backend: String = "cpu") {
+    ///   - visionBackend: Vision encoder backend (`"cpu"` or `"gpu"`). Default
+    ///     `nil` for text-only models. Only pass a non-nil value when the
+    ///     `.litertlm` file actually contains a vision encoder section;
+    ///     passing a value for a text-only model causes engine
+    ///     initialization to fail in the C++ runtime.
+    ///   - audioBackend: Audio encoder backend (`"cpu"` or `"gpu"`). Default
+    ///     `nil` for non-audio models. Same constraint as `visionBackend`.
+    public init(
+        modelPath: URL,
+        backend: String = "cpu",
+        visionBackend: String? = nil,
+        audioBackend: String? = nil
+    ) {
         self.modelPath = modelPath
         self.backend = backend
+        self.visionBackend = visionBackend
+        self.audioBackend = audioBackend
     }
 
     deinit {
@@ -98,6 +122,8 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
         let path = modelPath.path
         let backendStr = self.backend
+        let visionBackendStr = self.visionBackend
+        let audioBackendStr = self.audioBackend
         let startTime = CFAbsoluteTimeGetCurrent()
 
         guard FileManager.default.fileExists(atPath: path) else {
@@ -113,9 +139,24 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                     do {
                         litert_lm_set_min_log_level(1)
 
-                        guard let settings = litert_lm_engine_settings_create(
-                            path, backendStr, backendStr, backendStr
-                        ) else {
+                        // The C API expects four arguments:
+                        //   (model_path, backend, vision_backend, audio_backend)
+                        // where vision_backend and audio_backend are NULL for
+                        // models that do not include those encoders. Passing
+                        // the same `backendStr` for vision/audio on a
+                        // text-only model causes the C++ runtime to attempt
+                        // to load missing vision/audio sections from the
+                        // .litertlm file and return NULL from
+                        // litert_lm_engine_settings_create. The Swift wrapper
+                        // therefore must pass nil here unless the caller has
+                        // explicitly enabled the multimodal encoders.
+                        let settingsOpt: OpaquePointer? = Self.withOptionalCStrings(
+                            visionBackendStr,
+                            audioBackendStr
+                        ) { vPtr, aPtr in
+                            litert_lm_engine_settings_create(path, backendStr, vPtr, aPtr)
+                        }
+                        guard let settings = settingsOpt else {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
 
@@ -1108,6 +1149,29 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         if let text = obj["text"] as? String { return text }
 
         return json.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// Run `body` with two optional C strings derived from `s1` and `s2`,
+    /// passing `nil` when the source `String?` is nil. The pointers are valid
+    /// only for the duration of `body`.
+    fileprivate static func withOptionalCStrings<R>(
+        _ s1: String?,
+        _ s2: String?,
+        body: (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> R
+    ) -> R {
+        if let s1, let s2 {
+            return s1.withCString { p1 in
+                s2.withCString { p2 in
+                    body(p1, p2)
+                }
+            }
+        } else if let s1 {
+            return s1.withCString { p1 in body(p1, nil) }
+        } else if let s2 {
+            return s2.withCString { p2 in body(nil, p2) }
+        } else {
+            return body(nil, nil)
+        }
     }
 }
 
