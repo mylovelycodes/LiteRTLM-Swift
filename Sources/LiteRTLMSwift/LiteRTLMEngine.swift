@@ -128,6 +128,20 @@ public final class LiteRTLMEngine: @unchecked Sendable {
 
                         litert_lm_engine_settings_enable_benchmark(settings)
 
+                        // asc.5: preload ML Drift Metal accelerator sidecars by absolute
+                        // path. The LiteRT C++ runtime's `gpu_registry.cc` calls
+                        // `dlopen("libLiteRtMetalAccelerator.dylib", RTLD_LAZY|RTLD_LOCAL)`
+                        // with a BARE filename. On iOS, bare-name dlopen does NOT search
+                        // the app's `Frameworks/` directory, so it returns NULL and the
+                        // engine factory hands back NULL after ~100ms — the failure mode
+                        // we'd observed on iPhone 16 Pro asc.4. The runtime has a fallback
+                        // path that uses `dlsym(RTLD_DEFAULT, ...)` to resolve symbols
+                        // from any image already loaded into the process, so preloading
+                        // the sidecars here at absolute path makes the GPU registration
+                        // succeed without changing the upstream C++. Idempotent + harmless
+                        // when the dylibs are missing (e.g. CPU-only consumer builds).
+                        Self.preloadAcceleratorSidecarsOnce()
+
                         guard let createdEngine = litert_lm_engine_create(settings) else {
                             litert_lm_engine_settings_delete(settings)
                             throw LiteRTLMError.engineCreationFailed("litert_lm_engine_create returned NULL")
@@ -1108,6 +1122,102 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         if let text = obj["text"] as? String { return text }
 
         return json.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - GPU accelerator sidecar preload (asc.5)
+
+    /// Tracks whether sidecar preload has run in this process. Guarded by
+    /// `preloadLock` so concurrent engines don't race the file-system probe
+    /// or duplicate `dlopen` calls (dlopen itself is idempotent + ref-counted
+    /// so concurrent duplicates are not harmful, but we still want a single
+    /// crisp log line per process). Marked `nonisolated(unsafe)` because all
+    /// access is gated by `preloadLock` — Swift 6's static-isolation checker
+    /// can't see across NSLock so we vouch for it.
+    nonisolated(unsafe) private static var preloadDone = false
+    private static let preloadLock = NSLock()
+
+    /// Preloads the ML Drift Metal accelerator sidecars at absolute path so
+    /// the upstream `gpu_registry.cc` bare-name `dlopen` can resolve symbols
+    /// via the `dlsym(RTLD_DEFAULT, ...)` fallback. See call-site comment for
+    /// the full root-cause analysis (asc.5 / Issue #1050 / track_optionC).
+    ///
+    /// Resolution order for the framework path:
+    ///
+    ///   1. `Bundle(for: LiteRTLMEngine.self).privateFrameworksPath` —
+    ///      private frameworks directory inside the host app bundle. This is
+    ///      where the LiteRT-LM SPM consumer ends up after Xcode's "Embed
+    ///      Frameworks" build phase processes `CLiteRTLM.framework/`.
+    ///   2. Fall back to scanning `Bundle.allFrameworks` for any bundle whose
+    ///      bundle path ends in `/CLiteRTLM.framework`. Catches unusual host
+    ///      layouts (test bundles, XPC services).
+    ///   3. Give up silently. The upstream runtime's bare-name dlopen will
+    ///      then fail as before and CPU fallback engages — same outcome as
+    ///      pre-asc.5, never worse.
+    ///
+    /// Each sidecar is opened with `RTLD_NOW | RTLD_GLOBAL` so its exported
+    /// symbols become visible to subsequent `dlsym(RTLD_DEFAULT, ...)` calls.
+    /// Per-dylib failures are logged but not propagated; CPU fallback path
+    /// remains valid even if (say) `libLiteRtTopKMetalSampler.dylib` is
+    /// missing from a slimmer consumer build.
+    private static func preloadAcceleratorSidecarsOnce() {
+        preloadLock.lock()
+        defer { preloadLock.unlock() }
+        if preloadDone { return }
+        preloadDone = true
+
+        let frameworkPath = Self.resolveCLiteRTLMFrameworkPath()
+        guard let frameworkPath else {
+            log.warning("asc.5: CLiteRTLM.framework path not resolvable; skipping accelerator preload (CPU fallback path remains)")
+            return
+        }
+
+        // Order matters: load libLiteRt (base TFLite runtime) first, then
+        // accelerators that depend on it. RTLD_GLOBAL lets later libraries
+        // resolve symbols from already-loaded earlier ones.
+        let sidecars = [
+            "libLiteRt.dylib",
+            "libLiteRtMetalAccelerator.dylib",
+            "libLiteRtTopKMetalSampler.dylib"
+        ]
+        var openedCount = 0
+        for name in sidecars {
+            let path = "\(frameworkPath)/\(name)"
+            guard FileManager.default.fileExists(atPath: path) else {
+                log.info("asc.5: sidecar not present at \(path, privacy: .public) (slim consumer build) — skipping")
+                continue
+            }
+            if let handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL) {
+                _ = handle
+                openedCount += 1
+                log.info("asc.5: preloaded \(name, privacy: .public)")
+            } else {
+                let err: String
+                if let cstr = dlerror() {
+                    err = String(cString: cstr)
+                } else {
+                    err = "unknown"
+                }
+                log.error("asc.5: dlopen FAILED for \(name, privacy: .public) at \(path, privacy: .public): \(err, privacy: .public)")
+            }
+        }
+        log.notice("asc.5: accelerator preload complete — opened \(openedCount, privacy: .public)/\(sidecars.count, privacy: .public) sidecars from \(frameworkPath, privacy: .public)")
+    }
+
+    /// Resolves `CLiteRTLM.framework` absolute path. Returns nil if no match
+    /// found via either the canonical or scan path.
+    private static func resolveCLiteRTLMFrameworkPath() -> String? {
+        // Canonical: host app's private frameworks dir.
+        if let privateFw = Bundle(for: LiteRTLMEngine.self).privateFrameworksPath {
+            let candidate = "\(privateFw)/CLiteRTLM.framework"
+            if FileManager.default.fileExists(atPath: candidate) {
+                return candidate
+            }
+        }
+        // Fallback scan: catches non-standard host bundles.
+        for bundle in Bundle.allFrameworks where bundle.bundlePath.hasSuffix("/CLiteRTLM.framework") {
+            return bundle.bundlePath
+        }
+        return nil
     }
 }
 
