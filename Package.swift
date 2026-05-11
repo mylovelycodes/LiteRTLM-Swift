@@ -4,7 +4,8 @@ import PackageDescription
 let package = Package(
     name: "LiteRTLMSwift",
     platforms: [
-        .iOS(.v17)
+        .iOS(.v17),
+        .macOS(.v14)
     ],
     products: [
         .library(name: "LiteRTLMSwift", targets: ["LiteRTLMSwift"])
@@ -44,6 +45,14 @@ let package = Package(
             name: "LiteRtTopKMetalSampler",
             path: "Frameworks/LiteRtTopKMetalSampler.xcframework"
         ),
+        .binaryTarget(
+            name: "LiteRtWebGpuAccelerator",
+            path: "Frameworks/LiteRtWebGpuAccelerator.xcframework"
+        ),
+        .binaryTarget(
+            name: "LiteRtTopKWebGpuSampler",
+            path: "Frameworks/LiteRtTopKWebGpuSampler.xcframework"
+        ),
         .target(
             name: "LiteRTLMSwift",
             dependencies: [
@@ -51,7 +60,9 @@ let package = Package(
                 "GemmaConstraints",
                 "LiteRtRuntime",
                 "LiteRtMetalAccelerator",
-                "LiteRtTopKMetalSampler"
+                "LiteRtTopKMetalSampler",
+                .target(name: "LiteRtWebGpuAccelerator", condition: .when(platforms: [.macOS])),
+                .target(name: "LiteRtTopKWebGpuSampler", condition: .when(platforms: [.macOS]))
             ],
             path: "Sources/LiteRTLMSwift"
         ),

@@ -3,6 +3,9 @@ import CoreGraphics
 import ImageIO
 import os
 import CLiteRTLM
+#if canImport(Darwin)
+import Darwin
+#endif
 #if canImport(Metal)
 import Metal
 #endif
@@ -162,6 +165,11 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                             .appendingPathComponent("litertlm_cache").path
                         try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
                         litert_lm_engine_settings_set_cache_dir(settings, cacheDir)
+
+                        if backendStr == "gpu",
+                           let dispatchDir = Self.prepareAcceleratorDispatchDirectory() {
+                            litert_lm_engine_settings_set_litert_dispatch_lib_dir(settings, dispatchDir)
+                        }
 
                         litert_lm_engine_settings_enable_benchmark(settings)
 
@@ -1296,6 +1304,28 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             }
         }
         log.notice("asc.10: accelerator preload complete — opened \(openedCount, privacy: .public)/\(sidecars.count, privacy: .public) sidecars")
+    }
+
+    private static func prepareAcceleratorDispatchDirectory() -> String? {
+        guard let privateFw = Self.resolvePrivateFrameworksPath() else {
+            log.warning("LiteRT dispatch dir unavailable: private Frameworks path could not be resolved")
+            return nil
+        }
+
+        log.notice("LiteRT runtime lib dir using app Frameworks path \(privateFw, privacy: .public)")
+        return privateFw
+    }
+
+    private static func resolvePrivateFrameworksPath() -> String? {
+        if let path = Bundle.main.privateFrameworksPath,
+           FileManager.default.fileExists(atPath: "\(path)/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator") {
+            return path
+        }
+        if let path = Bundle(for: LiteRTLMEngine.self).privateFrameworksPath,
+           FileManager.default.fileExists(atPath: "\(path)/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator") {
+            return path
+        }
+        return nil
     }
 
     /// Resolves `CLiteRTLM.framework` absolute path. Returns nil if no match
