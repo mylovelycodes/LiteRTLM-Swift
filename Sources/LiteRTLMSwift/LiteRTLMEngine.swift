@@ -3,6 +3,12 @@ import CoreGraphics
 import ImageIO
 import os
 import CLiteRTLM
+#if canImport(Darwin)
+import Darwin
+#endif
+#if canImport(Metal)
+import Metal
+#endif
 
 /// Swift wrapper for Google's LiteRT-LM on-device inference engine.
 ///
@@ -111,10 +117,44 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             let createdEngine = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<OpaquePointer, any Error>) in
                 self.inferenceQueue.async {
                     do {
-                        litert_lm_set_min_log_level(1)
+                        // Path C diag iter 2: turn the C runtime's verbose logs
+                        // ON (level 0 = INFO) so any GPU rejection reason
+                        // (Metal device, kernel compile, capability check)
+                        // surfaces. Output goes to stderr/asl which Console.app
+                        // sees under the litert_lm subsystem; on device, our
+                        // outer DiagnosticLogger captures structured events
+                        // around it.
+                        litert_lm_set_min_log_level(0)
 
+                        // Path C diag iter 2: probe MTLCreateSystemDefaultDevice
+                        // BEFORE engine_create. If this returns nil under our
+                        // app sandbox, GPU init in the C runtime cannot
+                        // succeed regardless of dlopen/dlsym status. Captures
+                        // device name + GPU family + max threadgroup memory.
+                        // Only runs when the requested backend is "gpu".
+                        if backendStr == "gpu" {
+                            Self.probeMetalDevice()
+                        }
+
+                        // Path C diag iter 4 (THE FIX): audio + vision
+                        // backends must be "cpu" when text backend is
+                        // "gpu". The Gemma 4 E2B .litertlm model has
+                        // explicit `section_backend_constraint: cpu`
+                        // on audio_encoder, audio_adapter, and
+                        // vision_adapter sections (see litert_lm_loader
+                        // output). Passing "gpu" for those backends
+                        // triggers
+                        //   engine.cc:500] Failed to create engine:
+                        //   INVALID_ARGUMENT: Audio backend constraint
+                        //   mismatch. Model requires one of [cpu] but
+                        //   Audio backend is GPU
+                        // and litert_lm_engine_create returns NULL.
+                        // For "cpu" backend, all three can be "cpu" —
+                        // for "gpu" text, force vision/audio to "cpu".
+                        let visionBackend = (backendStr == "gpu") ? "cpu" : backendStr
+                        let audioBackend  = (backendStr == "gpu") ? "cpu" : backendStr
                         guard let settings = litert_lm_engine_settings_create(
-                            path, backendStr, backendStr, backendStr
+                            path, backendStr, visionBackend, audioBackend
                         ) else {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
@@ -126,7 +166,26 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                         try? FileManager.default.createDirectory(atPath: cacheDir, withIntermediateDirectories: true)
                         litert_lm_engine_settings_set_cache_dir(settings, cacheDir)
 
+                        if backendStr == "gpu",
+                           let dispatchDir = Self.prepareAcceleratorDispatchDirectory() {
+                            litert_lm_engine_settings_set_litert_dispatch_lib_dir(settings, dispatchDir)
+                        }
+
                         litert_lm_engine_settings_enable_benchmark(settings)
+
+                        // asc.5: preload ML Drift Metal accelerator sidecars by absolute
+                        // path. The LiteRT C++ runtime's `gpu_registry.cc` calls
+                        // `dlopen("libLiteRtMetalAccelerator.dylib", RTLD_LAZY|RTLD_LOCAL)`
+                        // with a BARE filename. On iOS, bare-name dlopen does NOT search
+                        // the app's `Frameworks/` directory, so it returns NULL and the
+                        // engine factory hands back NULL after ~100ms — the failure mode
+                        // we'd observed on iPhone 16 Pro asc.4. The runtime has a fallback
+                        // path that uses `dlsym(RTLD_DEFAULT, ...)` to resolve symbols
+                        // from any image already loaded into the process, so preloading
+                        // the sidecars here at absolute path makes the GPU registration
+                        // succeed without changing the upstream C++. Idempotent + harmless
+                        // when the dylibs are missing (e.g. CPU-only consumer builds).
+                        Self.preloadAcceleratorSidecarsOnce()
 
                         guard let createdEngine = litert_lm_engine_create(settings) else {
                             litert_lm_engine_settings_delete(settings)
@@ -1108,6 +1167,183 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         if let text = obj["text"] as? String { return text }
 
         return json.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - GPU accelerator sidecar preload (asc.5)
+
+    /// Tracks whether sidecar preload has run in this process. Guarded by
+    /// `preloadLock` so concurrent engines don't race the file-system probe
+    /// or duplicate `dlopen` calls (dlopen itself is idempotent + ref-counted
+    /// so concurrent duplicates are not harmful, but we still want a single
+    /// crisp log line per process). Marked `nonisolated(unsafe)` because all
+    /// access is gated by `preloadLock` — Swift 6's static-isolation checker
+    /// can't see across NSLock so we vouch for it.
+    nonisolated(unsafe) private static var preloadDone = false
+    private static let preloadLock = NSLock()
+
+    /// Preloads the ML Drift Metal accelerator sidecars at absolute path so
+    /// the upstream `gpu_registry.cc` bare-name `dlopen` can resolve symbols
+    /// via the `dlsym(RTLD_DEFAULT, ...)` fallback. See call-site comment for
+    /// the full root-cause analysis (asc.5 / Issue #1050 / track_optionC).
+    ///
+    /// **asc.10 topology change:** the ML-Drift Metal sidecars used to ship
+    /// as raw `.dylib` payloads inside `CLiteRTLM.framework/`. Apple's
+    /// `exportArchive` validator rejected that layout with ITMS-90171
+    /// ("Invalid bundle structure: a dynamic library is included in a bundle
+    /// that is not a framework"). Starting with asc.10 each sidecar is wrapped
+    /// in its own proper iOS framework (`LiteRtRuntime.framework`,
+    /// `LiteRtMetalAccelerator.framework`, `LiteRtTopKMetalSampler.framework`)
+    /// and SPM embeds them into the host app's private frameworks dir
+    /// alongside `CLiteRTLM.framework`. The preload below probes the new
+    /// per-framework layout FIRST, then falls back to the legacy in-CLiteRTLM
+    /// layout for forward-compatibility (e.g. consumers pinned to a pre-asc.10
+    /// tag).
+    ///
+    /// Each sidecar is opened with `RTLD_NOW | RTLD_GLOBAL` so its exported
+    /// symbols become visible to subsequent `dlsym(RTLD_DEFAULT, ...)` calls.
+    /// Per-dylib failures are logged but not propagated; CPU fallback path
+    /// remains valid even if (say) `libLiteRtTopKMetalSampler.dylib` is
+    /// missing from a slimmer consumer build.
+    /// Path C diag iter 2: Metal device probe. Logs MTLCreateSystemDefaultDevice
+    /// result + GPU family + max threadgroup memory to the os_log subsystem
+    /// `b4.litert.gpu.metal-probe`. If the device is nil, the LiteRT runtime's
+    /// gpu_metal backend cannot succeed regardless of dlsym state — that's
+    /// the smoking gun for sandbox/entitlement issues.
+    nonisolated private static func probeMetalDevice() {
+        let log = Logger(subsystem: "b4.litert.gpu.metal-probe", category: "Probe")
+        #if canImport(Metal)
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            log.error("MTLCreateSystemDefaultDevice() returned nil — Metal unavailable in this app sandbox; gpu_metal cannot succeed")
+            return
+        }
+        let name = device.name
+        let maxThreadgroupMem = device.maxThreadgroupMemoryLength
+        let recommendedWorkingSet = device.recommendedMaxWorkingSetSize
+        let maxBufferLen = device.maxBufferLength
+        let supportsRaytracing = device.supportsRaytracing
+        let supportsFunctionPointers = device.supportsFunctionPointers
+        // Probe Apple GPU families (iOS 16+). MTLGPUFamily enum cases are stable.
+        let families: [(String, MTLGPUFamily)] = [
+            ("apple1", .apple1), ("apple2", .apple2), ("apple3", .apple3),
+            ("apple4", .apple4), ("apple5", .apple5), ("apple6", .apple6),
+            ("apple7", .apple7), ("apple8", .apple8), ("apple9", .apple9),
+            ("metal3", .metal3),
+        ]
+        let supported = families.filter { device.supportsFamily($0.1) }.map { $0.0 }.joined(separator: ",")
+        log.notice("MTL device=\(name, privacy: .public) families=\(supported, privacy: .public) maxThreadgroupMemKB=\(maxThreadgroupMem / 1024) recommendedWorkingSetMB=\(recommendedWorkingSet / (1024*1024)) maxBufferMB=\(maxBufferLen / (1024*1024)) raytracing=\(supportsRaytracing) functionPointers=\(supportsFunctionPointers)")
+        #else
+        log.error("Metal framework not importable on this build — gpu_metal cannot succeed")
+        #endif
+    }
+
+    private static func preloadAcceleratorSidecarsOnce() {
+        preloadLock.lock()
+        defer { preloadLock.unlock() }
+        if preloadDone { return }
+        preloadDone = true
+
+        // Order matters: load LiteRtRuntime (base TFLite runtime) first, then
+        // accelerators that depend on it. RTLD_GLOBAL lets later libraries
+        // resolve symbols from already-loaded earlier ones.
+        //
+        // Each tuple: (framework_name, legacy_dylib_name).
+        //   * framework_name is used for the asc.10 per-framework layout:
+        //     <privateFrameworks>/<framework_name>.framework/<framework_name>
+        //   * legacy_dylib_name is used for the pre-asc.10 fallback layout:
+        //     <privateFrameworks>/CLiteRTLM.framework/<legacy_dylib_name>
+        let sidecars: [(framework: String, legacyDylib: String)] = [
+            ("LiteRtRuntime", "libLiteRt.dylib"),
+            ("LiteRtMetalAccelerator", "libLiteRtMetalAccelerator.dylib"),
+            ("LiteRtTopKMetalSampler", "libLiteRtTopKMetalSampler.dylib")
+        ]
+
+        // Resolve the private frameworks dir once. Same dir that holds
+        // CLiteRTLM.framework, so we can probe both layouts off one base.
+        let privateFw = Bundle(for: LiteRTLMEngine.self).privateFrameworksPath
+        let legacyBase = Self.resolveCLiteRTLMFrameworkPath()
+
+        if privateFw == nil && legacyBase == nil {
+            log.warning("asc.10: private frameworks path and CLiteRTLM.framework both unresolvable; skipping accelerator preload (CPU fallback path remains)")
+            return
+        }
+
+        var openedCount = 0
+        for (frameworkName, legacyDylibName) in sidecars {
+            // asc.10 per-framework layout (preferred).
+            var resolvedPath: String? = nil
+            if let pfw = privateFw {
+                let modern = "\(pfw)/\(frameworkName).framework/\(frameworkName)"
+                if FileManager.default.fileExists(atPath: modern) {
+                    resolvedPath = modern
+                }
+            }
+            // Pre-asc.10 fallback: dylib inside CLiteRTLM.framework.
+            if resolvedPath == nil, let legacy = legacyBase {
+                let candidate = "\(legacy)/\(legacyDylibName)"
+                if FileManager.default.fileExists(atPath: candidate) {
+                    resolvedPath = candidate
+                }
+            }
+
+            guard let path = resolvedPath else {
+                log.info("asc.10: sidecar \(frameworkName, privacy: .public) not present in either layout — skipping (slim consumer build or sim slice without Metal)")
+                continue
+            }
+            if let handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL) {
+                _ = handle
+                openedCount += 1
+                log.info("asc.10: preloaded \(frameworkName, privacy: .public) from \(path, privacy: .public)")
+            } else {
+                let err: String
+                if let cstr = dlerror() {
+                    err = String(cString: cstr)
+                } else {
+                    err = "unknown"
+                }
+                log.error("asc.10: dlopen FAILED for \(frameworkName, privacy: .public) at \(path, privacy: .public): \(err, privacy: .public)")
+            }
+        }
+        log.notice("asc.10: accelerator preload complete — opened \(openedCount, privacy: .public)/\(sidecars.count, privacy: .public) sidecars")
+    }
+
+    private static func prepareAcceleratorDispatchDirectory() -> String? {
+        guard let privateFw = Self.resolvePrivateFrameworksPath() else {
+            log.warning("LiteRT dispatch dir unavailable: private Frameworks path could not be resolved")
+            return nil
+        }
+
+        log.notice("LiteRT runtime lib dir using app Frameworks path \(privateFw, privacy: .public)")
+        return privateFw
+    }
+
+    private static func resolvePrivateFrameworksPath() -> String? {
+        if let path = Bundle.main.privateFrameworksPath,
+           FileManager.default.fileExists(atPath: "\(path)/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator") {
+            return path
+        }
+        if let path = Bundle(for: LiteRTLMEngine.self).privateFrameworksPath,
+           FileManager.default.fileExists(atPath: "\(path)/LiteRtMetalAccelerator.framework/LiteRtMetalAccelerator") {
+            return path
+        }
+        return nil
+    }
+
+    /// Resolves `CLiteRTLM.framework` absolute path. Returns nil if no match
+    /// found via either the canonical or scan path. Used for the pre-asc.10
+    /// fallback layout probe.
+    private static func resolveCLiteRTLMFrameworkPath() -> String? {
+        // Canonical: host app's private frameworks dir.
+        if let privateFw = Bundle(for: LiteRTLMEngine.self).privateFrameworksPath {
+            let candidate = "\(privateFw)/CLiteRTLM.framework"
+            if FileManager.default.fileExists(atPath: candidate) {
+                return candidate
+            }
+        }
+        // Fallback scan: catches non-standard host bundles.
+        for bundle in Bundle.allFrameworks where bundle.bundlePath.hasSuffix("/CLiteRTLM.framework") {
+            return bundle.bundlePath
+        }
+        return nil
     }
 }
 

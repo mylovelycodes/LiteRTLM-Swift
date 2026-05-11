@@ -199,6 +199,10 @@ LITERT_LM_C_API_EXPORT
 void litert_lm_engine_settings_set_cache_dir(LiteRtLmEngineSettings* settings,
                                              const char* cache_dir);
 
+LITERT_LM_C_API_EXPORT
+void litert_lm_engine_settings_set_litert_dispatch_lib_dir(
+    LiteRtLmEngineSettings* settings, const char* lib_dir);
+
 // Sets the activation data type.
 //
 // @param settings The engine settings.
