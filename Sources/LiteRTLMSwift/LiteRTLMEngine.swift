@@ -3,6 +3,9 @@ import CoreGraphics
 import ImageIO
 import os
 import CLiteRTLM
+#if canImport(Metal)
+import Metal
+#endif
 
 /// Swift wrapper for Google's LiteRT-LM on-device inference engine.
 ///
@@ -111,10 +114,44 @@ public final class LiteRTLMEngine: @unchecked Sendable {
             let createdEngine = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<OpaquePointer, any Error>) in
                 self.inferenceQueue.async {
                     do {
-                        litert_lm_set_min_log_level(1)
+                        // Path C diag iter 2: turn the C runtime's verbose logs
+                        // ON (level 0 = INFO) so any GPU rejection reason
+                        // (Metal device, kernel compile, capability check)
+                        // surfaces. Output goes to stderr/asl which Console.app
+                        // sees under the litert_lm subsystem; on device, our
+                        // outer DiagnosticLogger captures structured events
+                        // around it.
+                        litert_lm_set_min_log_level(0)
 
+                        // Path C diag iter 2: probe MTLCreateSystemDefaultDevice
+                        // BEFORE engine_create. If this returns nil under our
+                        // app sandbox, GPU init in the C runtime cannot
+                        // succeed regardless of dlopen/dlsym status. Captures
+                        // device name + GPU family + max threadgroup memory.
+                        // Only runs when the requested backend is "gpu".
+                        if backendStr == "gpu" {
+                            Self.probeMetalDevice()
+                        }
+
+                        // Path C diag iter 4 (THE FIX): audio + vision
+                        // backends must be "cpu" when text backend is
+                        // "gpu". The Gemma 4 E2B .litertlm model has
+                        // explicit `section_backend_constraint: cpu`
+                        // on audio_encoder, audio_adapter, and
+                        // vision_adapter sections (see litert_lm_loader
+                        // output). Passing "gpu" for those backends
+                        // triggers
+                        //   engine.cc:500] Failed to create engine:
+                        //   INVALID_ARGUMENT: Audio backend constraint
+                        //   mismatch. Model requires one of [cpu] but
+                        //   Audio backend is GPU
+                        // and litert_lm_engine_create returns NULL.
+                        // For "cpu" backend, all three can be "cpu" —
+                        // for "gpu" text, force vision/audio to "cpu".
+                        let visionBackend = (backendStr == "gpu") ? "cpu" : backendStr
+                        let audioBackend  = (backendStr == "gpu") ? "cpu" : backendStr
                         guard let settings = litert_lm_engine_settings_create(
-                            path, backendStr, backendStr, backendStr
+                            path, backendStr, visionBackend, audioBackend
                         ) else {
                             throw LiteRTLMError.engineCreationFailed("Failed to create engine settings")
                         }
@@ -1159,6 +1196,38 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// Per-dylib failures are logged but not propagated; CPU fallback path
     /// remains valid even if (say) `libLiteRtTopKMetalSampler.dylib` is
     /// missing from a slimmer consumer build.
+    /// Path C diag iter 2: Metal device probe. Logs MTLCreateSystemDefaultDevice
+    /// result + GPU family + max threadgroup memory to the os_log subsystem
+    /// `b4.litert.gpu.metal-probe`. If the device is nil, the LiteRT runtime's
+    /// gpu_metal backend cannot succeed regardless of dlsym state — that's
+    /// the smoking gun for sandbox/entitlement issues.
+    nonisolated private static func probeMetalDevice() {
+        let log = Logger(subsystem: "b4.litert.gpu.metal-probe", category: "Probe")
+        #if canImport(Metal)
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            log.error("MTLCreateSystemDefaultDevice() returned nil — Metal unavailable in this app sandbox; gpu_metal cannot succeed")
+            return
+        }
+        let name = device.name
+        let maxThreadgroupMem = device.maxThreadgroupMemoryLength
+        let recommendedWorkingSet = device.recommendedMaxWorkingSetSize
+        let maxBufferLen = device.maxBufferLength
+        let supportsRaytracing = device.supportsRaytracing
+        let supportsFunctionPointers = device.supportsFunctionPointers
+        // Probe Apple GPU families (iOS 16+). MTLGPUFamily enum cases are stable.
+        let families: [(String, MTLGPUFamily)] = [
+            ("apple1", .apple1), ("apple2", .apple2), ("apple3", .apple3),
+            ("apple4", .apple4), ("apple5", .apple5), ("apple6", .apple6),
+            ("apple7", .apple7), ("apple8", .apple8), ("apple9", .apple9),
+            ("metal3", .metal3),
+        ]
+        let supported = families.filter { device.supportsFamily($0.1) }.map { $0.0 }.joined(separator: ",")
+        log.notice("MTL device=\(name, privacy: .public) families=\(supported, privacy: .public) maxThreadgroupMemKB=\(maxThreadgroupMem / 1024) recommendedWorkingSetMB=\(recommendedWorkingSet / (1024*1024)) maxBufferMB=\(maxBufferLen / (1024*1024)) raytracing=\(supportsRaytracing) functionPointers=\(supportsFunctionPointers)")
+        #else
+        log.error("Metal framework not importable on this build — gpu_metal cannot succeed")
+        #endif
+    }
+
     private static func preloadAcceleratorSidecarsOnce() {
         preloadLock.lock()
         defer { preloadLock.unlock() }
