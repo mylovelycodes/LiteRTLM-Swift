@@ -1141,18 +1141,18 @@ public final class LiteRTLMEngine: @unchecked Sendable {
     /// via the `dlsym(RTLD_DEFAULT, ...)` fallback. See call-site comment for
     /// the full root-cause analysis (asc.5 / Issue #1050 / track_optionC).
     ///
-    /// Resolution order for the framework path:
-    ///
-    ///   1. `Bundle(for: LiteRTLMEngine.self).privateFrameworksPath` —
-    ///      private frameworks directory inside the host app bundle. This is
-    ///      where the LiteRT-LM SPM consumer ends up after Xcode's "Embed
-    ///      Frameworks" build phase processes `CLiteRTLM.framework/`.
-    ///   2. Fall back to scanning `Bundle.allFrameworks` for any bundle whose
-    ///      bundle path ends in `/CLiteRTLM.framework`. Catches unusual host
-    ///      layouts (test bundles, XPC services).
-    ///   3. Give up silently. The upstream runtime's bare-name dlopen will
-    ///      then fail as before and CPU fallback engages — same outcome as
-    ///      pre-asc.5, never worse.
+    /// **asc.10 topology change:** the ML-Drift Metal sidecars used to ship
+    /// as raw `.dylib` payloads inside `CLiteRTLM.framework/`. Apple's
+    /// `exportArchive` validator rejected that layout with ITMS-90171
+    /// ("Invalid bundle structure: a dynamic library is included in a bundle
+    /// that is not a framework"). Starting with asc.10 each sidecar is wrapped
+    /// in its own proper iOS framework (`LiteRtRuntime.framework`,
+    /// `LiteRtMetalAccelerator.framework`, `LiteRtTopKMetalSampler.framework`)
+    /// and SPM embeds them into the host app's private frameworks dir
+    /// alongside `CLiteRTLM.framework`. The preload below probes the new
+    /// per-framework layout FIRST, then falls back to the legacy in-CLiteRTLM
+    /// layout for forward-compatibility (e.g. consumers pinned to a pre-asc.10
+    /// tag).
     ///
     /// Each sidecar is opened with `RTLD_NOW | RTLD_GLOBAL` so its exported
     /// symbols become visible to subsequent `dlsym(RTLD_DEFAULT, ...)` calls.
@@ -1165,31 +1165,57 @@ public final class LiteRTLMEngine: @unchecked Sendable {
         if preloadDone { return }
         preloadDone = true
 
-        let frameworkPath = Self.resolveCLiteRTLMFrameworkPath()
-        guard let frameworkPath else {
-            log.warning("asc.5: CLiteRTLM.framework path not resolvable; skipping accelerator preload (CPU fallback path remains)")
+        // Order matters: load LiteRtRuntime (base TFLite runtime) first, then
+        // accelerators that depend on it. RTLD_GLOBAL lets later libraries
+        // resolve symbols from already-loaded earlier ones.
+        //
+        // Each tuple: (framework_name, legacy_dylib_name).
+        //   * framework_name is used for the asc.10 per-framework layout:
+        //     <privateFrameworks>/<framework_name>.framework/<framework_name>
+        //   * legacy_dylib_name is used for the pre-asc.10 fallback layout:
+        //     <privateFrameworks>/CLiteRTLM.framework/<legacy_dylib_name>
+        let sidecars: [(framework: String, legacyDylib: String)] = [
+            ("LiteRtRuntime", "libLiteRt.dylib"),
+            ("LiteRtMetalAccelerator", "libLiteRtMetalAccelerator.dylib"),
+            ("LiteRtTopKMetalSampler", "libLiteRtTopKMetalSampler.dylib")
+        ]
+
+        // Resolve the private frameworks dir once. Same dir that holds
+        // CLiteRTLM.framework, so we can probe both layouts off one base.
+        let privateFw = Bundle(for: LiteRTLMEngine.self).privateFrameworksPath
+        let legacyBase = Self.resolveCLiteRTLMFrameworkPath()
+
+        if privateFw == nil && legacyBase == nil {
+            log.warning("asc.10: private frameworks path and CLiteRTLM.framework both unresolvable; skipping accelerator preload (CPU fallback path remains)")
             return
         }
 
-        // Order matters: load libLiteRt (base TFLite runtime) first, then
-        // accelerators that depend on it. RTLD_GLOBAL lets later libraries
-        // resolve symbols from already-loaded earlier ones.
-        let sidecars = [
-            "libLiteRt.dylib",
-            "libLiteRtMetalAccelerator.dylib",
-            "libLiteRtTopKMetalSampler.dylib"
-        ]
         var openedCount = 0
-        for name in sidecars {
-            let path = "\(frameworkPath)/\(name)"
-            guard FileManager.default.fileExists(atPath: path) else {
-                log.info("asc.5: sidecar not present at \(path, privacy: .public) (slim consumer build) — skipping")
+        for (frameworkName, legacyDylibName) in sidecars {
+            // asc.10 per-framework layout (preferred).
+            var resolvedPath: String? = nil
+            if let pfw = privateFw {
+                let modern = "\(pfw)/\(frameworkName).framework/\(frameworkName)"
+                if FileManager.default.fileExists(atPath: modern) {
+                    resolvedPath = modern
+                }
+            }
+            // Pre-asc.10 fallback: dylib inside CLiteRTLM.framework.
+            if resolvedPath == nil, let legacy = legacyBase {
+                let candidate = "\(legacy)/\(legacyDylibName)"
+                if FileManager.default.fileExists(atPath: candidate) {
+                    resolvedPath = candidate
+                }
+            }
+
+            guard let path = resolvedPath else {
+                log.info("asc.10: sidecar \(frameworkName, privacy: .public) not present in either layout — skipping (slim consumer build or sim slice without Metal)")
                 continue
             }
             if let handle = dlopen(path, RTLD_NOW | RTLD_GLOBAL) {
                 _ = handle
                 openedCount += 1
-                log.info("asc.5: preloaded \(name, privacy: .public)")
+                log.info("asc.10: preloaded \(frameworkName, privacy: .public) from \(path, privacy: .public)")
             } else {
                 let err: String
                 if let cstr = dlerror() {
@@ -1197,14 +1223,15 @@ public final class LiteRTLMEngine: @unchecked Sendable {
                 } else {
                     err = "unknown"
                 }
-                log.error("asc.5: dlopen FAILED for \(name, privacy: .public) at \(path, privacy: .public): \(err, privacy: .public)")
+                log.error("asc.10: dlopen FAILED for \(frameworkName, privacy: .public) at \(path, privacy: .public): \(err, privacy: .public)")
             }
         }
-        log.notice("asc.5: accelerator preload complete — opened \(openedCount, privacy: .public)/\(sidecars.count, privacy: .public) sidecars from \(frameworkPath, privacy: .public)")
+        log.notice("asc.10: accelerator preload complete — opened \(openedCount, privacy: .public)/\(sidecars.count, privacy: .public) sidecars")
     }
 
     /// Resolves `CLiteRTLM.framework` absolute path. Returns nil if no match
-    /// found via either the canonical or scan path.
+    /// found via either the canonical or scan path. Used for the pre-asc.10
+    /// fallback layout probe.
     private static func resolveCLiteRTLMFrameworkPath() -> String? {
         // Canonical: host app's private frameworks dir.
         if let privateFw = Bundle(for: LiteRTLMEngine.self).privateFrameworksPath {
